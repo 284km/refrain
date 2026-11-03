@@ -1,43 +1,66 @@
 //! The `refrain` command.
 //!
-//! For now this is a small command-line front end that proves the engine runs
-//! on a real device and offline. The GUI comes later.
+//! For now this is a command-line front end that proves the engine and plugin
+//! hosting work on a real device and offline. The GUI comes later.
+
+mod audio;
+mod midi;
 
 use std::error::Error;
+use std::io::BufRead;
+use std::path::Path;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, SampleFormat, SizedSample};
-use refrain_engine::{Processor, Sine, render_offline};
+use cpal::traits::{DeviceTrait, HostTrait};
+use refrain_clap::{ClapPlugin, find_clap_files, load_entry, plugins_in, standard_paths};
+use refrain_engine::{NoteEvent, Sine, TimedEvent, render_offline};
+
+use audio::Output;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const USAGE: &str = "\
 usage:
-  refrain devices                         list output devices
-  refrain sine [options]                  play a sine wave on a device
-  refrain render <out.wav> [options]      write a sine wave to a WAV file
+  refrain devices                       list audio output devices
+  refrain midi                          list MIDI inputs
+  refrain plugins                       list installed CLAP plugins
+  refrain sine [options]                play a sine wave
+  refrain play <plugin.clap> [options]  play a CLAP instrument from a MIDI input
+  refrain render <out.wav> [options]    write a sine wave, or a plugin playing
+                                        a short phrase with --plugin, to a WAV file
 
 options:
-  --freq <hz>        frequency (default 440)
-  --seconds <s>      length (default 2)
-  --amp <0..1>       amplitude (default 0.2)
-  --device <id>      output device id, as printed by `refrain devices` (sine)
+  --device <id>      audio output, as `refrain devices` prints it
+  --midi <n|name>    MIDI input: its number in `refrain midi`, or part of its name
+  --id <plugin id>   which plugin, when a CLAP file holds several
+  --plugin <path>    render through this CLAP plugin
+  --demo             play the short phrase instead of reading MIDI (play)
+  --seconds <s>      length (default 2; play runs until Enter without it)
+  --freq <hz>        sine frequency (default 440)
+  --amp <0..1>       sine amplitude (default 0.2)
   --rate <hz>        sample rate (render, default 48000)
-  --channels <n>     channel count (render, default 2)";
+  --channels <n>     channel count (render, default 2)
+
+Loading a plugin runs its code in this process.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let with_path = |f: fn(&str, &Options) -> Result<()>, what: &str| match args.get(1) {
+        Some(path) if !path.starts_with("--") => {
+            Options::parse(&args[2..]).and_then(|o| f(path, &o))
+        }
+        _ => Err(format!("{what} needs a path").into()),
+    };
     let result = match args.first().map(String::as_str) {
         Some("devices") => devices(),
+        Some("midi") => list_midi(),
+        Some("plugins") => list_plugins(),
         Some("sine") => Options::parse(&args[1..]).and_then(|o| sine(&o)),
-        Some("render") => match args.get(1) {
-            Some(path) if !path.starts_with("--") => {
-                Options::parse(&args[2..]).and_then(|o| render(path, &o))
-            }
-            _ => Err("render needs an output path".into()),
-        },
+        Some("play") => with_path(play, "play"),
+        Some("render") => with_path(render, "render"),
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             Ok(())
@@ -54,10 +77,14 @@ fn main() -> ExitCode {
 }
 
 struct Options {
-    freq: f64,
-    seconds: f64,
-    amp: f32,
     device: Option<String>,
+    midi: Option<String>,
+    id: Option<String>,
+    plugin: Option<String>,
+    demo: bool,
+    seconds: Option<f64>,
+    freq: f64,
+    amp: f32,
     rate: u32,
     channels: u16,
 }
@@ -65,21 +92,32 @@ struct Options {
 impl Options {
     fn parse(args: &[String]) -> Result<Self> {
         let mut o = Options {
-            freq: 440.0,
-            seconds: 2.0,
-            amp: 0.2,
             device: None,
+            midi: None,
+            id: None,
+            plugin: None,
+            demo: false,
+            seconds: None,
+            freq: 440.0,
+            amp: 0.2,
             rate: 48_000,
             channels: 2,
         };
         let mut it = args.iter();
         while let Some(flag) = it.next() {
+            if flag == "--demo" {
+                o.demo = true;
+                continue;
+            }
             let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
-                "--freq" => o.freq = value.parse()?,
-                "--seconds" => o.seconds = value.parse()?,
-                "--amp" => o.amp = value.parse()?,
                 "--device" => o.device = Some(value.clone()),
+                "--midi" => o.midi = Some(value.clone()),
+                "--id" => o.id = Some(value.clone()),
+                "--plugin" => o.plugin = Some(value.clone()),
+                "--seconds" => o.seconds = Some(value.parse()?),
+                "--freq" => o.freq = value.parse()?,
+                "--amp" => o.amp = value.parse()?,
                 "--rate" => o.rate = value.parse()?,
                 "--channels" => o.channels = value.parse()?,
                 _ => return Err(format!("unknown option {flag}").into()),
@@ -91,8 +129,44 @@ impl Options {
         if o.channels == 0 || o.rate == 0 {
             return Err("--rate and --channels must be positive".into());
         }
+        if o.seconds.is_some_and(|s| s.is_nan() || s < 0.0) {
+            return Err("--seconds must not be negative".into());
+        }
         Ok(o)
     }
+}
+
+/// A short phrase for trying an instrument without a keyboard: C, E, G and C
+/// one after another, then the C major chord. Times are in seconds.
+fn demo_phrase() -> Vec<(f64, NoteEvent)> {
+    let mut phrase = Vec::new();
+    let mut note = |start: f64, end: f64, key: u8| {
+        phrase.push((
+            start,
+            NoteEvent::On {
+                channel: 0,
+                key,
+                velocity: 0.8,
+            },
+        ));
+        phrase.push((
+            end,
+            NoteEvent::Off {
+                channel: 0,
+                key,
+                velocity: 0.8,
+            },
+        ));
+    };
+    for (i, key) in [60, 64, 67, 72].into_iter().enumerate() {
+        let start = i as f64 * 0.25;
+        note(start, start + 0.2, key);
+    }
+    for key in [60, 64, 67] {
+        note(1.0, 1.8, key);
+    }
+    phrase.sort_by(|a, b| a.0.total_cmp(&b.0));
+    phrase
 }
 
 fn devices() -> Result<()> {
@@ -123,78 +197,149 @@ fn devices() -> Result<()> {
     Ok(())
 }
 
-fn sine(o: &Options) -> Result<()> {
-    let host = cpal::default_host();
-    let device = match &o.device {
-        Some(id) => host.device_by_id(&id.parse()?),
-        None => host.default_output_device(),
+fn list_midi() -> Result<()> {
+    let names = midi::port_names()?;
+    if names.is_empty() {
+        println!("no MIDI inputs");
     }
-    .ok_or("no output device")?;
-    let config = device.default_output_config()?;
-    println!(
-        "playing {} Hz on {} ({} ch, {} Hz, {})",
-        o.freq,
-        device.id()?,
-        config.channels(),
-        config.sample_rate(),
-        config.sample_format()
-    );
-    let sine = Sine::new(o.freq, o.amp);
-    let stream = match config.sample_format() {
-        SampleFormat::F32 => build::<f32>(&device, config.into(), sine)?,
-        SampleFormat::I16 => build::<i16>(&device, config.into(), sine)?,
-        SampleFormat::I32 => build::<i32>(&device, config.into(), sine)?,
-        SampleFormat::U16 => build::<u16>(&device, config.into(), sine)?,
-        other => return Err(format!("sample format {other} is not supported yet").into()),
-    };
-    stream.play()?;
-    std::thread::sleep(Duration::from_secs_f64(o.seconds));
+    for (i, name) in names.iter().enumerate() {
+        println!("{i}  {name}");
+    }
     Ok(())
 }
 
-/// Opens an output stream that runs `processor` in the device callback.
-fn build<T>(
-    device: &cpal::Device,
-    config: cpal::StreamConfig,
-    mut processor: impl Processor + 'static,
-) -> Result<cpal::Stream>
-where
-    T: SizedSample + FromSample<f32>,
-{
-    let channels = usize::from(config.channels);
-    processor.prepare(config.sample_rate as f32);
-    // The device may use a sample type other than f32. The engine still works
-    // in f32, through this buffer, which lives in the callback so the audio
-    // thread never allocates.
-    let mut scratch = [0.0_f32; 4096];
-    let chunk = scratch.len() / channels * channels;
-    let stream = device.build_output_stream(
-        config,
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            for out in data.chunks_mut(chunk) {
-                let tmp = &mut scratch[..out.len()];
-                processor.process(tmp, channels);
-                for (o, &s) in out.iter_mut().zip(tmp.iter()) {
-                    *o = T::from_sample(s);
-                }
+fn list_plugins() -> Result<()> {
+    let dirs = standard_paths();
+    for dir in &dirs {
+        println!("searching {}", dir.display());
+    }
+    let files = find_clap_files(&dirs);
+    if files.is_empty() {
+        println!("no CLAP plugins found");
+    }
+    for file in files {
+        println!("{}", file.display());
+        // SAFETY: the user installed these plugins; listing them means
+        // running their code, as every host does.
+        match unsafe { load_entry(&file) }.and_then(|e| plugins_in(&e)) {
+            Ok(plugins) => plugins.iter().for_each(|p| println!("    {p}")),
+            Err(e) => println!("    {e}"),
+        }
+    }
+    Ok(())
+}
+
+fn sine(o: &Options) -> Result<()> {
+    let output = Output::open(o.device.as_deref())?;
+    println!("playing {} Hz on {}", o.freq, output.describe());
+    let _stream = output.start(Sine::new(o.freq, o.amp), None)?;
+    std::thread::sleep(Duration::from_secs_f64(o.seconds.unwrap_or(2.0)));
+    Ok(())
+}
+
+fn play(path: &str, o: &Options) -> Result<()> {
+    // SAFETY: the user asked for this file to be loaded.
+    let entry = unsafe { load_entry(Path::new(path)) }?;
+    let mut plugin = ClapPlugin::new(&entry, o.id.as_deref())?;
+    let output = Output::open(o.device.as_deref())?;
+    let processor = plugin.activate(output.sample_rate(), refrain_engine::MAX_BLOCK_FRAMES)?;
+    println!("{}", plugin.info());
+    println!("output: {}", output.describe());
+
+    // Notes reach the audio thread through this queue, from the MIDI thread
+    // or, with --demo, from the loop below.
+    let (to_audio, from_notes) = rtrb::RingBuffer::new(1024);
+    let mut demo = Vec::new();
+    let mut demo_notes = None;
+    let mut _midi = None;
+    let mut seconds = o.seconds;
+    if o.demo {
+        demo = demo_phrase();
+        let end = demo.last().map_or(0.0, |e| e.0);
+        seconds.get_or_insert(end + 0.5);
+        demo_notes = Some(to_audio);
+        println!("playing the demo phrase");
+    } else {
+        _midi = midi::connect(o.midi.as_deref(), to_audio)?;
+        match &_midi {
+            Some(connection) => println!("MIDI input: {}", connection.port_name),
+            None => println!("no MIDI input; try --demo"),
+        }
+    }
+
+    let stream = output.start(processor, Some(from_notes))?;
+    let stop = Arc::new(AtomicBool::new(false));
+    if seconds.is_none() {
+        println!("press Enter to stop");
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let _ = std::io::stdin().lock().read_line(&mut String::new());
+            stop.store(true, Ordering::Release);
+        });
+    }
+
+    let start = Instant::now();
+    let mut demo = demo.into_iter().peekable();
+    loop {
+        let elapsed = start.elapsed().as_secs_f64();
+        if stop.load(Ordering::Acquire) || seconds.is_some_and(|s| elapsed >= s) {
+            break;
+        }
+        while let Some((_, note)) = demo.next_if(|(t, _)| *t <= elapsed) {
+            if let Some(tx) = demo_notes.as_mut() {
+                let _ = tx.push(note);
             }
-        },
-        |err| eprintln!("stream error: {err}"),
-        None,
-    )?;
-    Ok(stream)
+        }
+        plugin.poll_main_thread();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // The stream owns the plugin's processor. It has to stop before the
+    // plugin is destroyed.
+    drop(stream);
+    drop(plugin);
+    Ok(())
 }
 
 fn render(path: &str, o: &Options) -> Result<()> {
-    let frames = (o.seconds * f64::from(o.rate)).round() as usize;
-    let mut sine = Sine::new(o.freq, o.amp);
-    let samples = render_offline(
-        &mut sine,
-        o.rate as f32,
-        usize::from(o.channels),
-        frames,
-        128,
-    );
+    let seconds = o.seconds.unwrap_or(2.0);
+    let frames = (seconds * f64::from(o.rate)).round() as usize;
+    let rate = o.rate as f32;
+    let channels = usize::from(o.channels);
+    let block = 128;
+
+    let samples = match &o.plugin {
+        None => render_offline(
+            &mut Sine::new(o.freq, o.amp),
+            rate,
+            channels,
+            frames,
+            block,
+            &[],
+        ),
+        Some(plugin_path) => {
+            // SAFETY: the user asked for this file to be loaded.
+            let entry = unsafe { load_entry(Path::new(plugin_path)) }?;
+            let mut plugin = ClapPlugin::new(&entry, o.id.as_deref())?;
+            println!("{}", plugin.info());
+            let mut processor = plugin.activate(rate, block)?;
+            let events: Vec<TimedEvent> = demo_phrase()
+                .into_iter()
+                .map(|(t, event)| TimedEvent {
+                    frame: (t * f64::from(o.rate)).round() as u32,
+                    event,
+                })
+                .collect();
+            let out = render_offline(&mut processor, rate, channels, frames, block, &events);
+            if processor.has_failed() {
+                return Err("the plugin failed while processing".into());
+            }
+            drop(processor);
+            out
+        }
+    };
+
+    let peak = samples.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
     let spec = hound::WavSpec {
         channels: o.channels,
         sample_rate: o.rate,
@@ -206,6 +351,6 @@ fn render(path: &str, o: &Options) -> Result<()> {
         writer.write_sample(s)?;
     }
     writer.finalize()?;
-    println!("wrote {frames} frames to {path}");
+    println!("wrote {frames} frames to {path}, peak {peak:.3}");
     Ok(())
 }

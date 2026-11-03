@@ -9,5 +9,8 @@ publish.workspace = true
 
 [dependencies]
 refrain-engine.workspace = true
+refrain-clap = { path = "../refrain-clap" }
 cpal = "0.18"
 hound = "3.5"
+midir = "0.11"
+rtrb = "0.4"

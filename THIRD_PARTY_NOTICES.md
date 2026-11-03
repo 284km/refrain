@@ -9,6 +9,11 @@ refrain is MIT-licensed and depends only on permissively licensed crates.
 |---|---|---|
 | [cpal](https://github.com/RustAudio/cpal) | Apache-2.0 | Audio device I/O on macOS (CoreAudio) and Windows (WASAPI) |
 | [hound](https://github.com/ruuda/hound) | Apache-2.0 | Writing WAV files |
+| [midir](https://github.com/Boddlnagg/midir) | MIT | MIDI input |
+| [rtrb](https://github.com/mgeier/rtrb) | MIT OR Apache-2.0 | Lock-free queue from the MIDI thread to the audio thread |
+| [clack-host](https://github.com/prokopyl/clack) | MIT OR Apache-2.0 | Hosting CLAP plugins |
+| [clack-extensions](https://github.com/prokopyl/clack) | MIT OR Apache-2.0 | CLAP extensions (audio ports, note ports, log, params) |
+| [clack-plugin](https://github.com/prokopyl/clack) | MIT OR Apache-2.0 | The test synth only, which is not part of refrain itself |
 
 Their transitive dependencies are listed by `cargo tree` and are all under
 licenses in the allow list of `deny.toml`.

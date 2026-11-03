@@ -1,0 +1,17 @@
+[package]
+name = "refrain-clap"
+description = "Hosts CLAP plugins inside the refrain engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+refrain-engine.workspace = true
+clack-host = "0.2"
+clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "note-ports", "log", "params"] }
+
+[dev-dependencies]
+clack-host = { version = "0.2", features = ["clack-plugin"] }
+refrain-test-synth = { path = "../refrain-test-synth" }

@@ -31,7 +31,7 @@ CI で `cargo deny check` が [`deny.toml`](../../deny.toml) の一覧を使っ�
 
 - **VST3**: SDK は 3.8 から MIT ライセンス。refrain は、その SDK から生成されたバインディングの
   [`vst3`](https://github.com/coupler-rs/vst3-rs) crate（MIT OR Apache-2.0）を使う予定です
-- **CLAP**: MIT。refrain は [`clack`](https://github.com/prokopyl/clack)（MIT OR Apache-2.0）を使う予定です
+- **CLAP**: MIT。refrain は [`clack`](https://github.com/prokopyl/clack)（MIT OR Apache-2.0）を使っています
 - **Audio Unit**: macOS の一部です
 
 ## 商標

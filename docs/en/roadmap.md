@@ -5,8 +5,10 @@ heard or checked on both macOS and Windows.
 
 | # | Step | State |
 |---|---|---|
-| 1 | Play a sine wave on a device, and render it offline | Done. Device checked on macOS; Windows is built and tested in CI |
-| 2 | Load a CLAP or VST3 instrument and play it from a MIDI keyboard | Next |
+| 1 | Play a sine wave on a device, and render it offline | Done |
+| 2 | Load a CLAP or VST3 instrument and play it from a MIDI keyboard | Done for CLAP. Checked on a macOS device and through a virtual MIDI port; not yet with a hardware keyboard or on a Windows device |
+| 2a | Sustain pedal, pitch bend and other controllers | Next |
+| 2b | VST3 instruments | |
 | 3 | Open a plugin's editor in a window | |
 | 4 | Save and restore plugin state with a project | |
 | 5 | Record and play back MIDI clips on a timeline | |
@@ -15,13 +17,16 @@ heard or checked on both macOS and Windows.
 
 ## Alongside the steps
 
+- **Note timing.** Place notes from a MIDI input at the frame they were
+  played, instead of at the start of the next block.
 - **Low latency on Windows.** WASAPI exclusive mode through the `wasapi`
   crate, since `cpal` only uses shared mode.
 - **ASIO as an opt-in build feature.** Whoever builds it supplies the ASIO
   SDK themselves. It never enters this repository.
 - **Audio Units** on macOS, after VST3 and CLAP.
 - **Allocation checks on the audio thread** in debug builds.
-- **Test plugins built in this repository**, so CI can test plugin hosting
-  without third-party binaries.
+- **Plugin logs off the audio thread**, through a queue.
+- **Scanning plugins in a separate process**, so a plugin that crashes while
+  being listed does not take refrain down.
 - **Release work**: generated third-party notices, macOS signing and
   notarization, Windows signing.

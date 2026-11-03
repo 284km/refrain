@@ -25,6 +25,17 @@ jobs:
       - run: cargo test
       # CI has no sound card, so the engine is exercised through the offline path.
       - run: cargo run -- render target/ci.wav --seconds 1
+      # Load the test synth from its file, the way a real plugin is loaded.
+      - name: Render through the test synth
+        shell: bash
+        run: |
+          cargo build -p refrain-test-synth
+          case "$RUNNER_OS" in
+            macOS) plugin=target/debug/librefrain_test_synth.dylib ;;
+            Windows) plugin=target/debug/refrain_test_synth.dll ;;
+          esac
+          cargo run -- render target/synth.wav --plugin "$plugin" | tee target/render.log
+          grep -q "peak 0.4" target/render.log
 
   licenses:
     runs-on: ubuntu-latest

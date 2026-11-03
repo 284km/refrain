@@ -34,7 +34,7 @@ commit that does it.
 - **VST3**: the SDK is MIT-licensed since version 3.8. refrain will use the
   [`vst3`](https://github.com/coupler-rs/vst3-rs) crate (MIT OR Apache-2.0),
   whose bindings are generated from it.
-- **CLAP**: MIT. refrain will use [`clack`](https://github.com/prokopyl/clack)
+- **CLAP**: MIT. refrain uses [`clack`](https://github.com/prokopyl/clack)
   (MIT OR Apache-2.0).
 - **Audio Units**: part of macOS.
 
