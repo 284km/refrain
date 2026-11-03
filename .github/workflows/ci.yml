@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # rustup reads rust-toolchain.toml and installs the pinned version.
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      # CI has no sound card, so the engine is exercised through the offline path.
+      - run: cargo run -- render target/ci.wav --seconds 1
+
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  no-local-paths:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail on paths from a developer's machine
+        run: |
+          pattern='/(Users|home)/[A-Za-z0-9_.-]+/|[A-Za-z]:\\Users\\'
+          if git grep -nIE "$pattern" -- . ':!.github/workflows/ci.yml'; then
+            echo "Found a home-directory path. See docs/en/licensing.md." >&2
+            exit 1
+          fi

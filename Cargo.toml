@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/284km/refrain"
+publish = false
+
+[workspace.dependencies]
+refrain-engine = { path = "crates/refrain-engine" }

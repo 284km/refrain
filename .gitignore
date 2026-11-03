@@ -1,0 +1,21 @@
+/target
+
+# Audio written by `refrain render` while trying things out.
+*.wav
+
+# The ASIO SDK may not be committed. See docs/en/licensing.md.
+asiosdk*/
+ASIOSDK*/
+
+# Signing material and secrets. These belong in CI secrets, never in git.
+*.p12
+*.pfx
+*.pem
+*.key
+*.cer
+*.mobileprovision
+*.provisionprofile
+.env
+.env.*
+
+.DS_Store

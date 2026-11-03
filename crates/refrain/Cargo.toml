@@ -1,0 +1,13 @@
+[package]
+name = "refrain"
+description = "A DAW for macOS and Windows."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+refrain-engine.workspace = true
+cpal = "0.18"
+hound = "3.5"
