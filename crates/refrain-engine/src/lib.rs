@@ -15,10 +15,12 @@ pub const MAX_BLOCK_FRAMES: usize = 1024;
 pub const MAX_BLOCK_EVENTS: usize = 256;
 
 mod event;
+mod timeline;
 
 pub use event::{
     ALL_NOTES_OFF, Event, MAX_PEDAL_RELEASES, PITCH_BEND_CENTRE, SUSTAIN, SustainPedal, TimedEvent,
 };
+pub use timeline::{Recording, Sequencer, TICKS_PER_BEAT, Tempo};
 
 /// Something that fills audio buffers.
 ///

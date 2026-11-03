@@ -76,6 +76,16 @@ cargo run -- render out.wav --plugin song.refrain
 プロジェクトは小さな JSON のファイルです。中のプラグインのパスが相対パスなら、プロジェクトの
 フォルダからの相対パスです。
 
+録音するには、プロジェクトに向かって弾きます。MIDI から入ったものが新しいクリップになります。
+その間、すでにあるクリップも一緒に鳴るので、パートを重ねていけます。録音中はメトロノームが鳴ります。
+`--no-click` で止められます。
+
+```sh
+cargo run -- record song.refrain --tempo 100          # Enter で止めると、クリップが保存される
+cargo run -- play song.refrain                        # クリップが鳴り、一緒に弾ける
+cargo run -- render out.wav --plugin song.refrain     # クリップを WAV ファイルへ
+```
+
 インストール済みのインストゥルメントも同じように、`.clap` か `.vst3` のファイル（またはバンドル）を
 渡せば使えます。1 つのファイルに複数のプラグインがあるときは `--id` で選びます（VST3 は名前か
 クラス ID）。プラグインを読み込むと、そのコードが refrain の中で動きます。

@@ -78,6 +78,16 @@ cargo run -- render out.wav --plugin song.refrain
 A project is a small JSON file. A plugin path in it that is relative is
 relative to the project's folder.
 
+To record, play into a project. What comes in from MIDI becomes a new clip,
+while the clips already there play along, so parts can be layered. A
+metronome plays while recording; `--no-click` turns it off.
+
+```sh
+cargo run -- record song.refrain --tempo 100          # Enter to stop; the clip is saved
+cargo run -- play song.refrain                        # plays the clips, and you along with them
+cargo run -- render out.wav --plugin song.refrain     # the clips, to a WAV file
+```
+
 An installed instrument works the same way: pass its `.clap` or `.vst3`
 file or bundle. When a file holds several plugins, `--id` chooses one
 (for VST3, by name or class ID). Loading a plugin runs its code inside refrain.

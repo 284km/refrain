@@ -1,5 +1,7 @@
 //! MIDI input from keyboards and other controllers.
 
+use std::time::Instant;
+
 use midir::{Ignore, MidiInput, MidiInputConnection};
 use refrain_engine::Event;
 
@@ -24,13 +26,15 @@ pub struct Connection {
     _connection: MidiInputConnection<()>,
 }
 
-/// Connects to a MIDI input and sends what it plays to `events`.
+/// Connects to a MIDI input and sends what it plays to `events`, and, with
+/// the moment it arrived, to `record` if given.
 ///
 /// `select` is a port index or part of a port name. Without it, the first
 /// port is used. Returns `None` when there is no MIDI input at all.
 pub fn connect(
     select: Option<&str>,
     mut events: rtrb::Producer<Event>,
+    mut record: Option<rtrb::Producer<(Instant, Event)>>,
 ) -> Result<Option<Connection>> {
     let mut input = MidiInput::new(CLIENT)?;
     input.ignore(Ignore::All);
@@ -64,9 +68,13 @@ pub fn connect(
         "refrain input",
         move |_timestamp, bytes, _| {
             if let Some(event) = Event::from_midi(bytes) {
-                // When the queue is full the event is dropped rather than
+                let at = Instant::now();
+                // When a queue is full the event is dropped rather than
                 // blocking the MIDI thread.
                 let _ = events.push(event);
+                if let Some(record) = record.as_mut() {
+                    let _ = record.push((at, event));
+                }
             }
         },
         (),
@@ -94,7 +102,9 @@ mod tests {
             .create_virtual(&name)
             .unwrap();
         let (tx, mut rx) = rtrb::RingBuffer::new(16);
-        let connection = connect(Some(&name), tx).unwrap().unwrap();
+        let (to_record, mut recorded) = rtrb::RingBuffer::new(16);
+        let before = Instant::now();
+        let connection = connect(Some(&name), tx, Some(to_record)).unwrap().unwrap();
         assert_eq!(connection.port_name, name);
 
         port.send(&[0x90, 60, 127]).unwrap();
@@ -130,5 +140,21 @@ mod tests {
                 },
             ]
         );
+
+        // The same events reach the recording queue, stamped with when they
+        // arrived, in order. The MIDI thread fills that queue just after the
+        // other one, so wait for it too.
+        let mut stamps = Vec::new();
+        while stamps.len() < 3 && Instant::now() < deadline {
+            match recorded.pop() {
+                Ok((at, event)) => {
+                    stamps.push(at);
+                    assert!(received.contains(&event));
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert_eq!(stamps.len(), 3);
+        assert!(stamps.is_sorted() && stamps[0] >= before);
     }
 }

@@ -48,6 +48,27 @@ The engine. It has no OS, device or file code, and no dependencies.
   size, the way a device would, and hands each block the events that fall in
   it.
 
+### The timeline
+
+Clips keep their events in ticks, 960 to a beat, so a change of tempo keeps
+them in time with the music. The engine's timeline module holds:
+
+- `Tempo`, which turns ticks into seconds and frames and back.
+- `Sequencer`, a `Processor` that wraps another: it plays a sequence of
+  events at exact frames from the start, merged with the events it is given
+  live, and can add a metronome. Like the rest of the engine it gives the same
+  samples for any block size.
+- `Recording`, which collects events with the seconds they arrived at. When
+  it finishes, notes still held are released and pedals still down come up,
+  so a clip never leaves a note hanging when played back.
+
+`refrain record` plays the project's clips through the instrument and records
+what comes in from MIDI as a new clip. The MIDI thread stamps each event with
+the moment it arrived, before it reaches the audio thread, so the recording is
+as exact as the MIDI timestamps, not the block size. Recorded seconds become
+ticks at the project's tempo. The metronome is mixed into the output and is
+never recorded.
+
 ### `refrain-clap`
 
 Hosts CLAP plugins, using [`clack-host`](https://github.com/prokopyl/clack).
@@ -189,6 +210,10 @@ the device's sample type.
 - **Editors are embedded only.** CLAP plugins whose editor can only float in a
   window of its own are not supported yet, and neither is the CLAP timer
   extension, which some plugins use to redraw on Linux.
+- **Recording is not lined up with what was heard.** Times are measured from
+  when the audio stream started, without the output latency, so a recording
+  lands a few milliseconds late. There is no count-in yet, every clip starts at
+  the start of the timeline, and the tempo is one tempo for the whole project.
 - **Projects are saved when the editor closes or `play` ends**, with `--save`.
   There is no saving while playing, and no autosave.
 - **A project whose plugin has moved** is not found by ID in the installed
@@ -221,6 +246,8 @@ device:
   and never reading the MIDI mapping, and dropping edits made in the editor.
   Each one fails a test. For state: handing a CLAP plugin an empty state,
   skipping a VST3 component's `setState`, and saving an empty VST3 state. For
+  the timeline: playing sequenced events a frame late, dropping live events
+  while a sequence plays, and leaving held notes in a finished recording. For
   editors, the host was made to skip handing the
   plugin its window; the check that the window gained a child caught it. One of them first passed, because the
   test synth hid the host's mistake; the synth was changed so it no longer

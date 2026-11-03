@@ -11,14 +11,18 @@ heard or checked on both macOS and Windows.
 | 2b | VST3 instruments | Done. Test plugins agree with the CLAP ones sample for sample; a commercial VST3 instrument loads, renders and plays on a macOS device |
 | 3 | Open a plugin's editor in a window | Done. CLAP and VST3; the test plugins' editors open in CI on macOS and Windows, and a commercial VST3 editor opens on macOS |
 | 4 | Save and restore plugin state with a project | Done. CLAP and VST3; test projects restore and resave in CI on macOS and Windows, and a commercial VST3 instrument's state saves and restores on macOS |
-| 5 | Record and play back MIDI clips on a timeline | Next |
-| 6 | Effect chains and a mixer | |
+| 5 | Record and play back MIDI clips on a timeline | Done. Recording layers a new clip over the ones there, with a metronome; CI checks clips play back exactly like the same phrase sent as events |
+| 6 | Effect chains and a mixer | Next |
 | 7 | Render a project to a WAV file | |
 
 ## Alongside the steps
 
 - **Note timing.** Place notes from a MIDI input at the frame they were
-  played, instead of at the start of the next block.
+  played, instead of at the start of the next block. Recording already keeps
+  the moment each event arrived.
+- **Recording latency.** Line recorded events up with what was heard, by the
+  output latency; add a count-in, clips that start later in the timeline,
+  looping, and tempo changes.
 - **Low latency on Windows.** WASAPI exclusive mode through the `wasapi`
   crate, since `cpal` only uses shared mode.
 - **ASIO as an opt-in build feature.** Whoever builds it supplies the ASIO

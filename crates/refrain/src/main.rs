@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait};
-use refrain_engine::{Event, Processor, SUSTAIN, Sine, TimedEvent, render_offline};
+use refrain_engine::{Event, Processor, Recording, SUSTAIN, Sequencer, Sine, render_offline};
 
 use audio::Output;
 use plugin::Plugin;
@@ -33,9 +33,12 @@ usage:
   refrain play <plugin> [options]       play a .clap or .vst3 instrument from MIDI,
                                         with its editor open. A .refrain project
                                         works too, here and below
+  refrain record <plugin> [options]     like play, and record what comes in from MIDI
+                                        as a new clip; needs --save, or a project
   refrain editor <plugin> [options]     open a plugin's editor, without audio
-  refrain render <out.wav> [options]    write a sine wave, or a plugin playing
-                                        a short phrase with --plugin, to a WAV file
+  refrain render <out.wav> [options]    write a sine wave, or with --plugin a
+                                        project's clips or else a short phrase, to
+                                        a WAV file
 
 options:
   --device <id>      audio output, as `refrain devices` prints it
@@ -44,8 +47,10 @@ options:
   --plugin <path>    render through this .clap or .vst3 plugin
   --demo             play the short phrase instead of reading MIDI (play)
   --no-editor        do not open the plugin's editor (play)
-  --save <project>   when done, save the plugin and its state as a project
-                     (play, editor)
+  --save <project>   when done, save the plugin, its state and its clips as a
+                     project (play, record, editor)
+  --tempo <bpm>      beats per minute (default: the project's, or 120)
+  --click            play a metronome (play; record plays one unless --no-click)
   --seconds <s>      length (default 2; play and editor run until closed without it)
   --freq <hz>        sine frequency (default 440)
   --amp <0..1>       sine amplitude (default 0.2)
@@ -68,6 +73,7 @@ fn main() -> ExitCode {
         Some("plugins") => list_plugins(),
         Some("sine") => Options::parse(&args[1..]).and_then(|o| sine(&o)),
         Some("play") => with_path(play, "play"),
+        Some("record") => with_path(record, "record"),
         Some("editor") => with_path(editor_only, "editor"),
         Some("render") => with_path(render, "render"),
         Some("-h" | "--help" | "help") => {
@@ -93,6 +99,9 @@ struct Options {
     save: Option<String>,
     demo: bool,
     no_editor: bool,
+    tempo: Option<f64>,
+    click: bool,
+    no_click: bool,
     seconds: Option<f64>,
     freq: f64,
     amp: f32,
@@ -110,6 +119,9 @@ impl Options {
             save: None,
             demo: false,
             no_editor: false,
+            tempo: None,
+            click: false,
+            no_click: false,
             seconds: None,
             freq: 440.0,
             amp: 0.2,
@@ -126,6 +138,14 @@ impl Options {
                 o.no_editor = true;
                 continue;
             }
+            if flag == "--click" {
+                o.click = true;
+                continue;
+            }
+            if flag == "--no-click" {
+                o.no_click = true;
+                continue;
+            }
             let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
                 "--device" => o.device = Some(value.clone()),
@@ -133,6 +153,7 @@ impl Options {
                 "--id" => o.id = Some(value.clone()),
                 "--plugin" => o.plugin = Some(value.clone()),
                 "--save" => o.save = Some(value.clone()),
+                "--tempo" => o.tempo = Some(value.parse()?),
                 "--seconds" => o.seconds = Some(value.parse()?),
                 "--freq" => o.freq = value.parse()?,
                 "--amp" => o.amp = value.parse()?,
@@ -147,6 +168,9 @@ impl Options {
         if o.channels == 0 || o.rate == 0 {
             return Err("--rate and --channels must be positive".into());
         }
+        if o.tempo.is_some_and(|t| !(1.0..=1_000.0).contains(&t)) {
+            return Err("--tempo must be between 1 and 1000".into());
+        }
         if o.seconds.is_some_and(|s| s.is_nan() || s < 0.0) {
             return Err("--seconds must not be negative".into());
         }
@@ -157,6 +181,9 @@ impl Options {
 /// A short phrase for trying an instrument without a keyboard: C, E, G and C
 /// one after another with the sustain pedal down, so they ring together, then
 /// the C major chord without it. Times are in seconds.
+/// The demo's velocity: a MIDI value, so a recorded demo plays back exactly.
+const DEMO_VELOCITY: f32 = 100.0 / 127.0;
+
 fn demo_phrase() -> Vec<(f64, Event)> {
     let mut phrase = vec![
         (
@@ -182,7 +209,7 @@ fn demo_phrase() -> Vec<(f64, Event)> {
             Event::NoteOn {
                 channel: 0,
                 key,
-                velocity: 0.8,
+                velocity: DEMO_VELOCITY,
             },
         ));
         phrase.push((
@@ -190,7 +217,7 @@ fn demo_phrase() -> Vec<(f64, Event)> {
             Event::NoteOff {
                 channel: 0,
                 key,
-                velocity: 0.8,
+                velocity: DEMO_VELOCITY,
             },
         ));
     };
@@ -258,17 +285,54 @@ fn sine(o: &Options) -> Result<()> {
 }
 
 fn play(path: &str, o: &Options) -> Result<()> {
+    perform(path, o, false)
+}
+
+fn record(path: &str, o: &Options) -> Result<()> {
+    perform(path, o, true)
+}
+
+/// Plays an instrument, its project's clips, and what comes in live; and,
+/// when `recording`, records what comes in live as a new clip.
+fn perform(path: &str, o: &Options, recording: bool) -> Result<()> {
+    let is_project = Path::new(path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(refrain_project::EXTENSION));
+    // A recording is never thrown away: it goes back into the project it
+    // was made on, unless --save says where.
+    let save = match (&o.save, recording) {
+        (Some(save), _) => Some(save.clone()),
+        (None, true) if is_project => Some(path.to_owned()),
+        (None, true) => return Err("record needs --save <project> to keep the recording in".into()),
+        (None, false) => None,
+    };
+
     // SAFETY: the user asked for this file to be loaded.
     let mut plugin = unsafe { Plugin::open(Path::new(path), o.id.as_deref()) }?;
+    if let Some(bpm) = o.tempo {
+        plugin.set_tempo(bpm);
+    }
+    let tempo = plugin.tempo();
     let output = Output::open(o.device.as_deref())?;
-    let processor = plugin.activate(output.sample_rate(), refrain_engine::MAX_BLOCK_FRAMES)?;
+    let rate = output.sample_rate();
+    let processor = plugin.activate(rate, refrain_engine::MAX_BLOCK_FRAMES)?;
+    let mut sequencer = Sequencer::new(processor, plugin.sequence(rate));
+    let click = if recording { !o.no_click } else { o.click };
+    if click {
+        sequencer = sequencer.with_click(tempo, 4);
+    }
     let plugin_title = plugin.describe();
     println!("{plugin_title}");
     println!("output: {}", output.describe());
+    if click {
+        println!("click at {} beats per minute", tempo.beats_per_minute);
+    }
 
     // Events reach the audio thread through this queue, from the MIDI thread
-    // or, with --demo, from the loop below.
+    // or, with --demo, from the loop below. When recording, they also come
+    // to the loop below, with the moment they arrived.
     let (to_audio, from_notes) = rtrb::RingBuffer::new(1024);
+    let (to_recording, mut from_midi) = rtrb::RingBuffer::new(4096);
     let mut demo = Vec::new();
     let mut demo_events = None;
     let mut _midi = None;
@@ -280,17 +344,27 @@ fn play(path: &str, o: &Options) -> Result<()> {
         demo_events = Some(to_audio);
         println!("playing the demo phrase");
     } else {
-        _midi = midi::connect(o.midi.as_deref(), to_audio)?;
+        _midi = midi::connect(
+            o.midi.as_deref(),
+            to_audio,
+            recording.then_some(to_recording),
+        )?;
         match &_midi {
             Some(connection) => println!("MIDI input: {}", connection.port_name),
+            None if recording => return Err("there is no MIDI input to record from".into()),
             None => println!("no MIDI input; try --demo"),
         }
     }
 
-    let stream = output.start(processor, Some(from_notes))?;
+    let stream = output.start(sequencer, Some(from_notes))?;
+    // The timeline and the recording both start now.
+    let start = Instant::now();
     let stop = Arc::new(AtomicBool::new(false));
     if seconds.is_none() {
-        println!("press Enter, or close the editor, to stop");
+        println!(
+            "{} press Enter, or close the editor, to stop",
+            if recording { "recording;" } else { "playing;" }
+        );
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             let _ = std::io::stdin().lock().read_line(&mut String::new());
@@ -298,19 +372,27 @@ fn play(path: &str, o: &Options) -> Result<()> {
         });
     }
 
-    // One turn of the main thread: plays due demo events and answers the
-    // plugin. Returns false when it is time to stop.
-    let start = Instant::now();
+    // One turn of the main thread: plays due demo events, collects what is
+    // being recorded, and answers the plugin. Returns false when it is time
+    // to stop.
+    let mut taken = Recording::default();
     let mut demo = demo.into_iter().peekable();
     let mut tick = |plugin: &mut Plugin| {
         let elapsed = start.elapsed().as_secs_f64();
         if stop.load(Ordering::Acquire) || seconds.is_some_and(|s| elapsed >= s) {
             return false;
         }
-        while let Some((_, event)) = demo.next_if(|(t, _)| *t <= elapsed) {
+        while let Some((at, event)) = demo.next_if(|(t, _)| *t <= elapsed) {
             if let Some(tx) = demo_events.as_mut() {
                 let _ = tx.push(event);
             }
+            if recording {
+                // The demo is recorded at the moments it was meant for.
+                taken.add(at, event);
+            }
+        }
+        while let Ok((at, event)) = from_midi.pop() {
+            taken.add(at.saturating_duration_since(start).as_secs_f64(), event);
         }
         plugin.poll_main_thread();
         true
@@ -325,8 +407,25 @@ fn play(path: &str, o: &Options) -> Result<()> {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    let stopped = start.elapsed().as_secs_f64();
+    while let Ok((at, event)) = from_midi.pop() {
+        taken.add(at.saturating_duration_since(start).as_secs_f64(), event);
+    }
 
-    if let Some(project) = &o.save {
+    if recording {
+        if taken.is_empty() {
+            println!("nothing was played; the project keeps its clips as they were");
+        } else {
+            let events: Vec<(u64, Event)> = taken
+                .finish(stopped)
+                .into_iter()
+                .map(|(at, event)| (tempo.ticks_at(at), event))
+                .collect();
+            println!("recorded {} events into a new clip", events.len());
+            plugin.add_clip(&events);
+        }
+    }
+    if let Some(project) = &save {
         plugin.save_project(Path::new(project))?;
         println!("saved {project}");
     }
@@ -359,8 +458,7 @@ fn editor_only(path: &str, o: &Options) -> Result<()> {
 }
 
 fn render(path: &str, o: &Options) -> Result<()> {
-    let seconds = o.seconds.unwrap_or(2.0);
-    let frames = (seconds * f64::from(o.rate)).round() as usize;
+    let frames = (o.seconds.unwrap_or(2.0) * f64::from(o.rate)).round() as usize;
     let rate = o.rate as f32;
     let channels = usize::from(o.channels);
     let block = 128;
@@ -378,15 +476,24 @@ fn render(path: &str, o: &Options) -> Result<()> {
             // SAFETY: the user asked for this file to be loaded.
             let mut plugin = unsafe { Plugin::open(Path::new(plugin_path), o.id.as_deref()) }?;
             println!("{}", plugin.describe());
-            let mut processor = plugin.activate(rate, block)?;
-            let events: Vec<TimedEvent> = demo_phrase()
-                .into_iter()
-                .map(|(t, event)| TimedEvent {
-                    frame: (t * f64::from(o.rate)).round() as u32,
-                    event,
-                })
-                .collect();
-            let out = render_offline(&mut processor, rate, channels, frames, block, &events);
+            if let Some(bpm) = o.tempo {
+                plugin.set_tempo(bpm);
+            }
+            let processor = plugin.activate(rate, block)?;
+            // A project's clips, or else the demo phrase.
+            let mut sequence = plugin.sequence(rate);
+            let mut frames = frames;
+            if sequence.is_empty() {
+                sequence = demo_phrase()
+                    .into_iter()
+                    .map(|(t, event)| ((t * f64::from(o.rate)).round() as u64, event))
+                    .collect();
+            } else if o.seconds.is_none() {
+                // The clips, and a second for the sound to die away.
+                frames = plugin.sequence_end(rate) as usize + o.rate as usize;
+            }
+            let mut processor = Sequencer::new(processor, sequence);
+            let out = render_offline(&mut processor, rate, channels, frames, block, &[]);
             if processor.has_failed() {
                 return Err("the plugin failed while processing".into());
             }
@@ -396,6 +503,7 @@ fn render(path: &str, o: &Options) -> Result<()> {
     };
 
     let peak = samples.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+    let written = samples.len() / channels;
     let spec = hound::WavSpec {
         channels: o.channels,
         sample_rate: o.rate,
@@ -407,6 +515,6 @@ fn render(path: &str, o: &Options) -> Result<()> {
         writer.write_sample(s)?;
     }
     writer.finalize()?;
-    println!("wrote {frames} frames to {path}, peak {peak:.3}");
+    println!("wrote {written} frames to {path}, peak {peak:.3}");
     Ok(())
 }

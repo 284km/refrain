@@ -5,7 +5,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 use refrain_clap::{ClapError, ClapPlugin};
-use refrain_engine::Processor;
+use refrain_engine::{Event, Processor, Tempo};
 use refrain_project::{Format, Project, State};
 use refrain_vst3::{Vst3Error, Vst3Module, Vst3Plugin, Vst3State};
 
@@ -18,10 +18,11 @@ pub struct EditorSize {
     pub resizable: bool,
 }
 
-/// A plugin, and the file it came from.
+/// A plugin, the file it came from, and the project it came with, if any.
 pub struct Plugin {
     kind: Kind,
     file: PathBuf,
+    project: Option<Project>,
 }
 
 impl Deref for Plugin {
@@ -40,7 +41,7 @@ impl DerefMut for Plugin {
 
 impl Plugin {
     /// Loads a plugin from a `.clap` or `.vst3` file (see [`Kind::open`]), or
-    /// the plugin of a project, with its state.
+    /// the plugin of a project, with its state and clips.
     ///
     /// # Safety
     ///
@@ -54,6 +55,7 @@ impl Plugin {
             return Ok(Self {
                 kind,
                 file: path.to_path_buf(),
+                project: None,
             });
         }
         let project = Project::read(path)?;
@@ -67,48 +69,95 @@ impl Plugin {
             )
         })?;
         kind.load_state(&instrument.state)?;
+        let clips = match project.clips.len() {
+            0 => String::new(),
+            1 => ", 1 clip".to_owned(),
+            n => format!(", {n} clips"),
+        };
         println!(
-            "project {}: {} with its saved state",
+            "project {}: {} with its saved state{clips}, at {} beats per minute",
             path.display(),
-            instrument.name
+            instrument.name,
+            project.tempo
         );
-        Ok(Self { kind, file })
+        Ok(Self {
+            kind,
+            file,
+            project: Some(project),
+        })
     }
 
-    /// Writes a project holding this plugin and its current state.
-    pub fn save_project(&mut self, project: &Path) -> Result<()> {
-        let (format, id, name, state) = match &mut self.kind {
-            Kind::Clap(p) => {
-                let data = p.save_state()?.unwrap_or_default();
-                let info = p.info();
-                (
-                    Format::Clap,
-                    info.id.clone(),
-                    info.name.clone(),
-                    State {
-                        data,
-                        controller: Vec::new(),
-                    },
-                )
-            }
+    pub fn tempo(&self) -> Tempo {
+        self.project
+            .as_ref()
+            .map_or(Tempo::new(120.0), Project::tempo)
+    }
+
+    pub fn set_tempo(&mut self, beats_per_minute: f64) {
+        self.project_mut().tempo = beats_per_minute;
+    }
+
+    /// The clips' events at frames from the start, at `sample_rate`.
+    pub fn sequence(&self, sample_rate: f32) -> Vec<(u64, Event)> {
+        let Some(project) = &self.project else {
+            return Vec::new();
+        };
+        let tempo = project.tempo();
+        project
+            .sequence()
+            .into_iter()
+            .map(|(tick, event)| (tempo.frame_at(tick, sample_rate), event))
+            .collect()
+    }
+
+    /// The frame just after the clips' last event, at `sample_rate`.
+    pub fn sequence_end(&self, sample_rate: f32) -> u64 {
+        self.project
+            .as_ref()
+            .map_or(0, |p| p.tempo().frame_at(p.end(), sample_rate))
+    }
+
+    /// Adds a clip at the start of the timeline, holding `events` at ticks.
+    pub fn add_clip(&mut self, events: &[(u64, Event)]) {
+        self.project_mut().add_clip(0, events);
+    }
+
+    /// The project, made empty if the plugin came without one. Its path and
+    /// state are filled in when it is saved.
+    fn project_mut(&mut self) -> &mut Project {
+        let (format, id, name) = match &self.kind {
+            Kind::Clap(p) => (Format::Clap, p.info().id.clone(), p.info().name.clone()),
+            Kind::Vst3(p) => (Format::Vst3, p.info().id.clone(), p.info().name.clone()),
+        };
+        let file = self.file.clone();
+        self.project.get_or_insert_with(|| {
+            Project::new(Path::new("."), format, &file, id, name, State::default())
+        })
+    }
+
+    /// Writes a project holding this plugin, its current state, and the
+    /// clips it came with or recorded.
+    pub fn save_project(&mut self, file: &Path) -> Result<()> {
+        let state = match &mut self.kind {
+            Kind::Clap(p) => State {
+                data: p.save_state()?.unwrap_or_default(),
+                controller: Vec::new(),
+            },
             Kind::Vst3(p) => {
                 let Vst3State {
                     component,
                     controller,
                 } = p.save_state()?;
-                let info = p.info();
-                (
-                    Format::Vst3,
-                    info.id.clone(),
-                    info.name.clone(),
-                    State {
-                        data: component,
-                        controller,
-                    },
-                )
+                State {
+                    data: component,
+                    controller,
+                }
             }
         };
-        Project::new(project, format, &self.file, id, name, state).write(project)?;
+        let plugin = self.file.clone();
+        let project = self.project_mut();
+        project.set_instrument(file, &plugin, state);
+        project.write(file)?;
         Ok(())
     }
 }

@@ -48,12 +48,24 @@ jobs:
         run: |
           for f in clap vst3; do
             cargo run -- render target/half-$f.wav --plugin tests/projects/half-volume-$f.refrain | tee target/project.log
-            grep -Eq "peak 0\.29" target/project.log
+            # Half of the 0.576 the demo phrase peaks at.
+            grep -q "peak 0.288" target/project.log
             cargo run -- editor tests/projects/half-volume-$f.refrain --seconds 1 --save target/resaved-$f.refrain
             cargo run -- render target/resaved-$f.wav --plugin target/resaved-$f.refrain
             cmp target/half-$f.wav target/resaved-$f.wav
           done
           cmp target/half-clap.wav target/half-vst3.wav
+      # A project's clips play back exactly like the same phrase sent as
+      # events, in both formats.
+      - name: Play back clips
+        shell: bash
+        run: |
+          for f in clap vst3; do
+            cargo run -- render target/phrase-$f.wav --plugin tests/projects/phrase-$f.refrain --seconds 2
+            cargo run -- render target/demo-$f.wav --plugin target/test-plugins/refrain-test-synth.$f
+            cmp target/phrase-$f.wav target/demo-$f.wav
+          done
+          cmp target/phrase-clap.wav target/phrase-vst3.wav
       # Open each test plugin's editor in a real window, and check it ended up
       # inside that window.
       - name: Open the test plugins' editors

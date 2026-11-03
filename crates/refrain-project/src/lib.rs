@@ -1,20 +1,30 @@
 //! refrain's project files.
 //!
 //! A project names an instrument plugin and holds its state, so opening the
-//! project brings the sound back. It is JSON, so it can be read and diffed:
+//! project brings the sound back, and holds the clips played on it. It is
+//! JSON, so it can be read and diffed:
 //!
 //! ```json
 //! {
-//!   "refrain": 1,
+//!   "refrain": 2,
+//!   "tempo": 120.0,
+//!   "ticks_per_beat": 960,
 //!   "instrument": {
 //!     "format": "vst3",
 //!     "path": "plugins/Synth.vst3",
 //!     "id": "7E5C0A312B9D4F1A9C3E6D521F0A8B44",
 //!     "name": "Synth",
 //!     "state": { "data": "cnRzMQAAAD8=", "controller": "" }
-//!   }
+//!   },
+//!   "clips": [
+//!     { "start": 0, "events": [[0, [144, 60, 100]], [480, [128, 60, 64]]] }
+//!   ]
 //! }
 //! ```
+//!
+//! A clip starts at a tick of the timeline, and its events are at ticks from
+//! the clip's start, each a MIDI 1.0 message. Version 1 projects had no tempo
+//! and no clips; they read as 120 beats per minute with no clips.
 //!
 //! States are base64. `data` is a CLAP plugin's state or a VST3 component's;
 //! `controller` is a VST3 controller's, and empty for CLAP. A relative `path`
@@ -27,19 +37,44 @@ use std::path::{Component, Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use refrain_engine::{Event, TICKS_PER_BEAT, Tempo};
 use serde::{Deserialize, Serialize};
 
 /// The file extension of projects.
 pub const EXTENSION: &str = "refrain";
 
-/// The version of the format this crate reads and writes.
-pub const VERSION: u32 = 1;
+/// The version of the format this crate writes. It reads this and older ones.
+pub const VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     /// The format version.
     pub refrain: u32,
+    /// Beats per minute.
+    #[serde(default = "default_tempo")]
+    pub tempo: f64,
+    #[serde(default = "default_ticks_per_beat")]
+    pub ticks_per_beat: u64,
     pub instrument: Instrument,
+    #[serde(default)]
+    pub clips: Vec<Clip>,
+}
+
+fn default_tempo() -> f64 {
+    120.0
+}
+
+fn default_ticks_per_beat() -> u64 {
+    TICKS_PER_BEAT
+}
+
+/// Events played on the instrument, from a tick of the timeline.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Clip {
+    /// The tick of the timeline the clip starts at.
+    pub start: u64,
+    /// Ticks from the clip's start, and MIDI 1.0 messages, in order.
+    pub events: Vec<(u64, Vec<u8>)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +124,8 @@ pub enum ProjectError {
     Parse(PathBuf, serde_json::Error),
     /// Written by a newer refrain.
     Version(u32),
+    /// Readable, but not a valid project. Says why.
+    Invalid(PathBuf, String),
 }
 
 impl fmt::Display for ProjectError {
@@ -98,8 +135,9 @@ impl fmt::Display for ProjectError {
             Self::Parse(path, e) => write!(f, "{} is not a refrain project: {e}", path.display()),
             Self::Version(v) => write!(
                 f,
-                "the project is version {v}; this refrain reads version {VERSION}"
+                "the project is version {v}; this refrain reads up to version {VERSION}"
             ),
+            Self::Invalid(path, why) => write!(f, "{}: {why}", path.display()),
         }
     }
 }
@@ -119,6 +157,8 @@ impl Project {
     ) -> Self {
         Self {
             refrain: VERSION,
+            tempo: default_tempo(),
+            ticks_per_beat: TICKS_PER_BEAT,
             instrument: Instrument {
                 format,
                 path: store_path(plugin, file),
@@ -126,7 +166,49 @@ impl Project {
                 name,
                 state,
             },
+            clips: Vec::new(),
         }
+    }
+
+    /// Points the project at the plugin at `plugin`, as seen from the current
+    /// folder, for a project to be written to `file`; and gives it `state`.
+    pub fn set_instrument(&mut self, file: &Path, plugin: &Path, state: State) {
+        self.instrument.path = store_path(plugin, file);
+        self.instrument.state = state;
+    }
+
+    pub fn tempo(&self) -> Tempo {
+        Tempo::new(self.tempo)
+    }
+
+    /// Every clip's events at ticks of the timeline, in order.
+    pub fn sequence(&self) -> Vec<(u64, Event)> {
+        let mut events: Vec<(u64, Event)> = self
+            .clips
+            .iter()
+            .flat_map(|clip| {
+                clip.events.iter().filter_map(move |(tick, midi)| {
+                    Some((clip.start + tick, Event::from_midi(midi)?))
+                })
+            })
+            .collect();
+        events.sort_by_key(|e| e.0);
+        events
+    }
+
+    /// The tick just after the last event of any clip.
+    pub fn end(&self) -> u64 {
+        self.sequence().last().map_or(0, |e| e.0 + 1)
+    }
+
+    /// Adds a clip at `start`, holding `events` at ticks from the start.
+    pub fn add_clip(&mut self, start: u64, events: &[(u64, Event)]) {
+        let mut events: Vec<(u64, Vec<u8>)> = events
+            .iter()
+            .map(|(tick, event)| (*tick, midi_bytes(event)))
+            .collect();
+        events.sort_by_key(|e| e.0);
+        self.clips.push(Clip { start, events });
     }
 
     pub fn read(file: &Path) -> Result<Self, ProjectError> {
@@ -136,13 +218,40 @@ impl Project {
         if project.refrain > VERSION {
             return Err(ProjectError::Version(project.refrain));
         }
+        let invalid = |why: String| ProjectError::Invalid(file.into(), why);
+        if project.ticks_per_beat != TICKS_PER_BEAT {
+            return Err(invalid(format!("ticks_per_beat must be {TICKS_PER_BEAT}")));
+        }
+        if !(project.tempo.is_finite() && (1.0..=1_000.0).contains(&project.tempo)) {
+            return Err(invalid(format!(
+                "tempo {} is not between 1 and 1000",
+                project.tempo
+            )));
+        }
+        for (i, clip) in project.clips.iter().enumerate() {
+            if let Some((tick, midi)) = clip
+                .events
+                .iter()
+                .find(|(_, m)| Event::from_midi(m).is_none())
+            {
+                return Err(invalid(format!(
+                    "clip {i}: tick {tick}: {midi:?} is not a MIDI message refrain reads"
+                )));
+            }
+        }
         Ok(project)
     }
 
-    /// Writes the project to `file`, replacing it only once the new contents
-    /// are complete.
+    /// Writes the project to `file`, in the current version of the format,
+    /// replacing the file only once the new contents are complete.
     pub fn write(&self, file: &Path) -> Result<(), ProjectError> {
-        let mut text = serde_json::to_string_pretty(self).expect("projects serialize");
+        // A project read from an older version may have gained what that
+        // version cannot hold; an older refrain must not read it as its own.
+        let current = Project {
+            refrain: VERSION,
+            ..self.clone()
+        };
+        let mut text = serde_json::to_string_pretty(&current).expect("projects serialize");
         text.push('\n');
         let partial = file.with_extension("refrain-partial");
         std::fs::write(&partial, text).map_err(|e| ProjectError::Io(partial.clone(), e))?;
@@ -158,6 +267,17 @@ impl Project {
             fold_parents(&folder_of(file).join(stored))
         }
     }
+}
+
+/// A MIDI message's bytes: one status byte and its data, without padding.
+fn midi_bytes(event: &Event) -> Vec<u8> {
+    let bytes = event.to_midi();
+    let length = if matches!(event, Event::ChannelPressure { .. }) {
+        2
+    } else {
+        3
+    };
+    bytes[..length].to_vec()
 }
 
 /// How to store `plugin` in a project written to `file`: absolute paths stay
@@ -244,6 +364,12 @@ mod tests {
     fn sample() -> Project {
         Project {
             refrain: VERSION,
+            tempo: 120.0,
+            ticks_per_beat: TICKS_PER_BEAT,
+            clips: vec![Clip {
+                start: 0,
+                events: vec![(0, vec![144, 60, 100]), (480, vec![128, 60, 64])],
+            }],
             instrument: Instrument {
                 format: Format::Vst3,
                 path: "plugins/Synth.vst3".into(),
@@ -260,17 +386,90 @@ mod tests {
     #[test]
     fn reads_what_the_documentation_shows() {
         let text = r#"{
-          "refrain": 1,
+          "refrain": 2,
+          "tempo": 120.0,
+          "ticks_per_beat": 960,
           "instrument": {
             "format": "vst3",
             "path": "plugins/Synth.vst3",
             "id": "7E5C0A312B9D4F1A9C3E6D521F0A8B44",
             "name": "Synth",
             "state": { "data": "cnRzMQAAAD8=", "controller": "" }
-          }
+          },
+          "clips": [
+            { "start": 0, "events": [[0, [144, 60, 100]], [480, [128, 60, 64]]] }
+          ]
         }"#;
         let project: Project = serde_json::from_str(text).unwrap();
         assert_eq!(project, sample());
+    }
+
+    #[test]
+    fn a_version_1_project_reads_with_no_clips_at_120() {
+        let text = r#"{"refrain": 1, "instrument": {"format": "clap", "path": "a.clap",
+            "id": "x", "name": "x", "state": {"data": ""}}}"#;
+        let project: Project = serde_json::from_str(text).unwrap();
+        assert_eq!(project.tempo, 120.0);
+        assert!(project.clips.is_empty());
+    }
+
+    #[test]
+    fn an_older_project_is_written_in_the_current_version() {
+        let dir = std::env::temp_dir().join(format!("refrain-project-o-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("old.refrain");
+        let old = Project {
+            refrain: 1,
+            ..sample()
+        };
+        old.write(&file).unwrap();
+        assert_eq!(Project::read(&file).unwrap().refrain, VERSION);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clips_become_one_sequence_in_order() {
+        let mut project = sample();
+        let on = |key| Event::NoteOn {
+            channel: 0,
+            key,
+            velocity: 100.0 / 127.0,
+        };
+        let off = |key| Event::NoteOff {
+            channel: 0,
+            key,
+            velocity: 64.0 / 127.0,
+        };
+        project.add_clip(240, &[(480, off(64)), (0, on(64))]);
+        assert_eq!(
+            project.sequence(),
+            [(0, on(60)), (240, on(64)), (480, off(60)), (720, off(64))]
+        );
+        assert_eq!(project.end(), 721);
+        // What a clip stores reads back as the same events.
+        assert_eq!(project.clips[1].events[0], (0, vec![0x90, 64, 100]));
+    }
+
+    #[test]
+    fn refuses_clips_it_cannot_play() {
+        let dir = std::env::temp_dir().join(format!("refrain-project-c-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("bad.refrain");
+        let mut project = sample();
+        project.clips[0].events.push((960, vec![0xc0, 5]));
+        project.write(&file).unwrap();
+        assert!(matches!(
+            Project::read(&file),
+            Err(ProjectError::Invalid(..))
+        ));
+        project = sample();
+        project.tempo = 0.0;
+        project.write(&file).unwrap();
+        assert!(matches!(
+            Project::read(&file),
+            Err(ProjectError::Invalid(..))
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -297,9 +496,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("refrain-project-v-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("new.refrain");
+        // write() always writes the current version, so write this by hand.
         let mut newer = sample();
         newer.refrain = VERSION + 1;
-        newer.write(&file).unwrap();
+        std::fs::write(&file, serde_json::to_string(&newer).unwrap()).unwrap();
         assert!(matches!(
             Project::read(&file),
             Err(ProjectError::Version(_))
