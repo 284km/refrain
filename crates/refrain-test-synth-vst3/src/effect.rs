@@ -1,6 +1,7 @@
 //! The VST3 test effect's processor: [`refrain_test_tone::effect`], with a
 //! stereo input and output and its gain as its state. It takes no events.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::slice;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -15,6 +16,7 @@ use crate::{Kind, copy_wstring};
 pub(crate) struct EffectProcessor {
     // The gain, as f32 bits: set from a saved state on the main thread.
     gain: AtomicU32,
+    process_mode: Cell<i32>,
 }
 
 impl Class for EffectProcessor {
@@ -25,6 +27,7 @@ impl EffectProcessor {
     pub(crate) fn new() -> Self {
         Self {
             gain: AtomicU32::new(effect::DEFAULT_GAIN.to_bits()),
+            process_mode: Cell::new(ProcessModes_::kRealtime as int32),
         }
     }
 }
@@ -175,7 +178,9 @@ impl IAudioProcessorTrait for EffectProcessor {
         0
     }
 
-    unsafe fn setupProcessing(&self, _setup: *mut ProcessSetup) -> tresult {
+    unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
+        self.process_mode
+            .set(crate::note_process_mode(unsafe { &*setup }));
         kResultOk
     }
 
@@ -185,6 +190,9 @@ impl IAudioProcessorTrait for EffectProcessor {
 
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
         let data = unsafe { &*data };
+        if data.processMode != self.process_mode.get() {
+            return kResultFalse;
+        }
         if data.numOutputs < 1 || data.outputs.is_null() {
             // A flush: no audio.
             return kResultOk;

@@ -49,6 +49,11 @@ The engine. It has no OS, device or file code, and no dependencies.
 - `render_offline` drives a `Processor` without a device, in blocks of a chosen
   size, the way a device would, and hands each block the events that fall in
   it.
+- `render_until_quiet` does the same and then goes on until the sound dies
+  away: until a `Tail`'s number of frames in a row are no louder than its
+  threshold, or its longest tail is reached. The quiet frames at the end are
+  cut off, but never the frames asked for. Where it ends does not depend on
+  the block size either.
 
 ### Tracks and the mix
 
@@ -209,6 +214,11 @@ takes notes only, so refrain plays the pedal for it. Tests send all four the
 same events and require the same samples. That checks refrain's pedal against
 the plugins' own, and the CLAP host and the VST3 host against each other.
 
+When the host tells them they render offline, the CLAP plugins through the
+`render` extension and the VST3 ones through their process mode, they note
+it, so tests can see it arrived. The VST3 plugins also fail any block whose
+process mode differs from the one they were set up with.
+
 They save their volume, set from MIDI controller 7, as their state. The state
 format is the same in both formats, so a state saved through one host can be
 restored through the other: a test that both hosts pass the bytes intact.
@@ -239,6 +249,14 @@ The `refrain` command. It owns everything that touches the platform:
 - MIDI input, through `midir`, feeding the audio thread through an `rtrb`
   queue,
 - WAV files, through `hound`.
+
+`refrain render` tells every plugin it is rendering offline (CLAP's `render`
+extension, VST3's `kOffline` process mode), renders the project's tracks to
+the end of the last event, and then until the sound has been 100 dB down for
+2 seconds, for at most 60. The file is 32-bit float, or 16- or 24-bit
+integers, rounded to the nearest step and clipped at full scale. Dither, when
+asked for, is triangular noise of one step from a fixed seed, so the same
+project always gives the same file.
 
 A `Session` is a project with all its plugins loaded and their states given
 back. It builds the `Mixer` for playing or rendering, with each track's
@@ -271,6 +289,10 @@ the device's sample type.
   the start of the timeline, and the tempo is one tempo for the whole project.
 - **Effects add latency that is not made up for.** A plugin that reports
   latency is not delayed against the others yet.
+- **Rendering** writes WAV only, at the sample rate asked for: there is no
+  sample rate conversion, no normalizing, and no rendering of single tracks
+  (stems). A plugin with a hard real-time requirement is still rendered
+  offline.
 - **The mix is fixed while playing.** Tracks, effects and the mix are set
   before playing starts; changing them means starting again. There are no
   sends, buses or groups, no automation, and effects get no MIDI and no side
@@ -307,7 +329,9 @@ device:
   and never reading the MIDI mapping, and dropping edits made in the editor.
   Each one fails a test. For effects and the mix: feeding an effect silence
   instead of its input (in both hosts), running a chain backwards, swapping
-  the sides of the pan, and not passing a project's mix to the mixer. The pan
+  the sides of the pan, and not passing a project's mix to the mixer. For
+  rendering: setting a VST3 plugin up offline but running its blocks in real
+  time, and telling a CLAP plugin real time when offline was asked for. The pan
   swap first passed the engine's tests, whose levels added up the same with
   the sides swapped; the levels were changed so they no longer do. CI's mix
   check caught it, and the mix not being passed on, from the peaks of each

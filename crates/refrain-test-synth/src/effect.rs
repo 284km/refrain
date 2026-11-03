@@ -8,6 +8,7 @@ use clack_extensions::audio_ports::{
     AudioPortFlags, AudioPortInfo, AudioPortInfoWriter, AudioPortType, PluginAudioPorts,
     PluginAudioPortsImpl,
 };
+use clack_extensions::render::{PluginRender, PluginRenderImpl, RenderMode};
 use clack_extensions::state::{PluginState, PluginStateImpl};
 use clack_plugin::prelude::*;
 use clack_plugin::process::audio::ChannelPair;
@@ -24,7 +25,8 @@ impl Plugin for TestEffect {
     fn declare_extensions(builder: &mut PluginExtensions<Self>, _shared: Option<&EffectShared>) {
         builder
             .register::<PluginAudioPorts>()
-            .register::<PluginState>();
+            .register::<PluginState>()
+            .register::<PluginRender>();
     }
 }
 
@@ -112,6 +114,16 @@ impl PluginAudioPortsImpl for EffectMainThread<'_> {
                 in_place_pair: Some(ClapId::new(0)),
             });
         }
+    }
+}
+
+impl PluginRenderImpl for EffectMainThread<'_> {
+    fn has_hard_realtime_requirement(&self) -> bool {
+        false
+    }
+
+    fn set(&self, mode: RenderMode) -> Result<(), PluginError> {
+        crate::set_render_mode(mode)
     }
 }
 

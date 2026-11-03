@@ -449,3 +449,22 @@ fn an_effect_keeps_its_gain_in_its_state() {
         .unwrap_err();
     assert!(matches!(err, ClapError::State(_)), "{err}");
 }
+
+#[test]
+fn offline_rendering_is_announced_and_sounds_the_same() {
+    let entry = entry();
+    for id in [ID, EFFECT_ID] {
+        let mut plugin = ClapPlugin::new(&entry, Some(id)).unwrap();
+        assert!(plugin.set_offline(true), "{id}");
+        assert_eq!(refrain_test_synth::told_offline(), Some(true));
+        assert!(plugin.set_offline(false));
+        assert_eq!(refrain_test_synth::told_offline(), Some(false));
+    }
+    let mut plugin = ClapPlugin::new(&entry, Some(ID)).unwrap();
+    plugin.set_offline(true);
+    let mut processor = plugin.activate(RATE, 1_024).unwrap();
+    let out = render_offline(&mut processor, RATE, 2, FRAMES, 128, &chord());
+    assert!(!processor.has_failed());
+    drop(processor);
+    assert_eq!(out, render(ID, 128, &chord()));
+}

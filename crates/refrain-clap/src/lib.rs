@@ -26,6 +26,7 @@ use clack_extensions::note_ports::{NoteDialects, NotePortInfoBuffer, PluginNoteP
 use clack_extensions::params::{
     HostParams, HostParamsImplMainThread, HostParamsImplShared, ParamClearFlags, ParamRescanFlags,
 };
+use clack_extensions::render::{PluginRender, RenderMode};
 use clack_extensions::state::{HostState, HostStateImpl, PluginState};
 use clack_host::events::event_types::{MidiEvent, NoteOffEvent, NoteOnEvent};
 use clack_host::events::{Event as _, EventFlags, Match};
@@ -364,6 +365,26 @@ impl ClapPlugin {
         state
             .load(&handle, &mut &bytes[..])
             .map_err(|_| ClapError::State("load"))
+    }
+
+    /// Tells the plugin whether it is rendering offline, as when writing a
+    /// file: it then need not keep up with real time, and may use slower,
+    /// better algorithms. Call before activating.
+    ///
+    /// Returns whether the plugin took the mode. A plugin without the render
+    /// extension does not care, and one that must run in real time refuses
+    /// offline rendering; both go on as they are.
+    pub fn set_offline(&mut self, offline: bool) -> bool {
+        let handle = self.instance.plugin_handle();
+        let Some(render) = handle.get_extension::<PluginRender>() else {
+            return false;
+        };
+        let mode = if offline {
+            RenderMode::Offline
+        } else {
+            RenderMode::Realtime
+        };
+        render.set(&handle, mode).is_ok()
     }
 
     /// Opens the plugin's editor inside `parent`, at the window's `scale`.

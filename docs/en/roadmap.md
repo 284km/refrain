@@ -13,8 +13,8 @@ heard or checked on both macOS and Windows.
 | 4 | Save and restore plugin state with a project | Done. CLAP and VST3; test projects restore and resave in CI on macOS and Windows, and a commercial VST3 instrument's state saves and restores on macOS |
 | 5 | Record and play back MIDI clips on a timeline | Done. Recording layers a new clip over the ones there, with a metronome; CI checks clips play back exactly like the same phrase sent as events |
 | 6 | Effect chains and a mixer | Done. Tracks with an instrument, a chain of effects, volume, pan, mute and solo, mixed through a master chain; test effects in both formats; CI puts a project together with the project commands and checks its mix in both formats |
-| 7 | Render a project to a WAV file | Next. `render` already plays a project's tracks through the mix; what is left is choosing the bit depth, waiting for effects' tails, and asking plugins to render offline |
-| 8 | refrain's own GUI: transport, tracks, clips and the mixer | |
+| 7 | Render a project to a WAV file | Done. Renders until the sound dies away, with plugins told it is offline, to 32-bit float or 16- or 24-bit integers with optional dither; CI checks the length, the file sizes and that dither is the same every time |
+| 8 | refrain's own GUI: transport, tracks, clips and the mixer | Next |
 
 ## Alongside the steps
 
@@ -28,6 +28,8 @@ heard or checked on both macOS and Windows.
   so a chain with latency stays in time.
 - **More of the mix**: sends, buses and groups, automation, and changing the
   mix while playing.
+- **More from rendering**: single tracks (stems), sample rate conversion,
+  normalizing, and other formats such as FLAC.
 - **Low latency on Windows.** WASAPI exclusive mode through the `wasapi`
   crate, since `cpal` only uses shared mode.
 - **ASIO as an opt-in build feature.** Whoever builds it supplies the ASIO

@@ -58,6 +58,20 @@ impl Kind {
         })
     }
 
+    /// Whether the plugin renders offline, as when writing a file. Takes
+    /// effect when the plugin is next activated. Returns whether the plugin
+    /// took the mode; one that does not simply goes on as it is.
+    pub fn set_offline(&mut self, offline: bool) -> bool {
+        match self {
+            Self::Clap(p) => p.set_offline(offline),
+            // Every VST3 plugin is set up with a process mode.
+            Self::Vst3(p) => {
+                p.set_offline(offline);
+                true
+            }
+        }
+    }
+
     /// The plugin's format, ID and name, as a project names it.
     pub fn identity(&self) -> (Format, String, String) {
         match self {

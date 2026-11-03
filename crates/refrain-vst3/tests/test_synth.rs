@@ -551,3 +551,23 @@ fn an_effect_keeps_its_gain_in_its_state() {
     let err = plugin.load_state(&synth_state).unwrap_err();
     assert!(matches!(err, Vst3Error::State(_)), "{err}");
 }
+
+#[test]
+fn offline_rendering_is_set_up_and_sounds_the_same() {
+    use refrain_test_synth_vst3::set_up_offline;
+    let module = module();
+    for name in [NAME, EFFECT_NAME] {
+        let mut plugin = Vst3Plugin::new(&module, Some(name)).unwrap();
+        plugin.set_offline(true);
+        let mut processor = plugin.activate(RATE, 1_024).unwrap();
+        assert_eq!(set_up_offline(), Some(true), "{name}");
+        // The plugins fail a block whose mode differs from the set-up one.
+        let out = render_offline(&mut processor, RATE, 2, FRAMES, 128, &chord());
+        assert!(!processor.has_failed(), "{name}");
+        drop(processor);
+        if name == NAME {
+            assert_eq!(out, render_vst3(NAME, 2, 128, &chord()));
+            assert_eq!(set_up_offline(), Some(false));
+        }
+    }
+}

@@ -106,6 +106,17 @@ cargo run -- record band.refrain --track 1                # MIDI はトラック
 cargo run -- editor band.refrain --track 2 --fx 1 --save band.refrain   # エフェクトの画面
 ```
 
+`render` はプロジェクトを WAV ファイルに書き出します。最後のノートのあとも、音が消えるまで書き続け、
+最後の無音を切り落とします。`--seconds` を付けると、その長さで書きます。書き出しのときは、
+リアルタイムではないことをプラグインに伝えるので、プラグインはいちばん良い品質で処理できます。
+ファイルは `--bits` で 16 か 24 を指定しない限り 32 bit の浮動小数で、`--dither` を付けると
+そこに三角分布のディザーを加えます。
+
+```sh
+cargo run -- render band.wav --plugin band.refrain --bits 24
+cargo run -- render band-cd.wav --plugin band.refrain --bits 16 --dither --rate 44100
+```
+
 インストール済みのインストゥルメントやエフェクトも同じように、`.clap` か `.vst3` のファイル（またはバンドル）を
 渡せば使えます。1 つのファイルに複数のプラグインがあるときは `--id` で選びます（VST3 は名前か
 クラス ID）。プラグインを読み込むと、そのコードが refrain の中で動きます。

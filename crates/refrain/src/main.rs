@@ -9,6 +9,7 @@ mod midi;
 mod plugin;
 mod project;
 mod session;
+mod wav;
 
 use std::error::Error;
 use std::io::BufRead;
@@ -19,7 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait};
-use refrain_engine::{Event, Processor, Recording, SUSTAIN, Sequencer, Sine, render_offline};
+use refrain_engine::{
+    Event, Processor, Recording, SUSTAIN, Sequencer, Sine, Tail, render_offline, render_until_quiet,
+};
 
 use audio::Output;
 use session::{Session, Slot};
@@ -41,7 +44,8 @@ usage:
   refrain editor <plugin> [options]     open a plugin's editor, without audio
   refrain render <out.wav> [options]    write a sine wave, or with --plugin a
                                         project's clips or else a short phrase, to
-                                        a WAV file
+                                        a WAV file: until the sound dies away, and
+                                        with plugins told it is not real time
 
 projects:
   refrain new <project>                 make an empty project
@@ -75,11 +79,15 @@ options:
                      the clips (play, record, editor)
   --tempo <bpm>      beats per minute (default: the project's, or 120; new)
   --click            play a metronome (play; record plays one unless --no-click)
-  --seconds <s>      length (default 2; play and editor run until closed without it)
+  --seconds <s>      length (default: render waits for the sound to die away, a
+                     sine lasts 2; play and editor run until closed)
   --freq <hz>        sine frequency (default 440)
   --amp <0..1>       sine amplitude (default 0.2)
   --rate <hz>        sample rate (render, default 48000)
   --channels <n>     channel count (render, default 2)
+  --bits <16|24|32>  sample size: 16- or 24-bit integers, or 32-bit float (render,
+                     default 32)
+  --dither           add triangular dither to a 16- or 24-bit file (render)
 
 Loading a plugin runs its code in this process.";
 
@@ -190,6 +198,8 @@ pub(crate) struct Options {
     amp: f32,
     rate: u32,
     channels: u16,
+    bits: u16,
+    dither: bool,
 }
 
 impl Options {
@@ -218,6 +228,8 @@ impl Options {
             amp: 0.2,
             rate: 48_000,
             channels: 2,
+            bits: 32,
+            dither: false,
         };
         let mut it = args.iter();
         while let Some(flag) = it.next() {
@@ -235,6 +247,10 @@ impl Options {
             }
             if flag == "--no-click" {
                 o.no_click = true;
+                continue;
+            }
+            if flag == "--dither" {
+                o.dither = true;
                 continue;
             }
             let switch = match flag.as_str() {
@@ -274,6 +290,7 @@ impl Options {
                 "--amp" => o.amp = value.parse()?,
                 "--rate" => o.rate = value.parse()?,
                 "--channels" => o.channels = value.parse()?,
+                "--bits" => o.bits = value.parse()?,
                 _ => return Err(format!("unknown option {flag}").into()),
             }
         }
@@ -604,18 +621,29 @@ fn editor_only(path: &str, o: &Options) -> Result<()> {
     Ok(())
 }
 
+/// How long to wait for the sound to die away after the end, and how quiet
+/// is quiet: 100 dB down, below the smallest step of a 16-bit file.
+const TAIL: Tail = Tail {
+    threshold: 1e-5,
+    quiet_frames: 0,
+    max_frames: 0,
+};
+const TAIL_QUIET_SECONDS: f64 = 2.0;
+const TAIL_MAX_SECONDS: f64 = 60.0;
+
 fn render(path: &str, o: &Options) -> Result<()> {
-    let frames = (o.seconds.unwrap_or(2.0) * f64::from(o.rate)).round() as usize;
+    let format = wav::Format::new(o.bits, o.dither)?;
     let rate = o.rate as f32;
     let channels = usize::from(o.channels);
     let block = 128;
+    let seconds = |s: f64| (s * f64::from(o.rate)).round() as usize;
 
     let samples = match &o.plugin {
         None => render_offline(
             &mut Sine::new(o.freq, o.amp),
             rate,
             channels,
-            frames,
+            seconds(o.seconds.unwrap_or(2.0)),
             block,
             &[],
         ),
@@ -628,7 +656,6 @@ fn render(path: &str, o: &Options) -> Result<()> {
             let live = o.live_track();
             // The project's clips, or else the demo phrase on the track.
             let mut demo = Vec::new();
-            let mut frames = frames;
             if session.project.end() == 0 {
                 session.check_track(live)?;
                 println!(
@@ -638,19 +665,43 @@ fn render(path: &str, o: &Options) -> Result<()> {
                 );
                 demo = demo_phrase()
                     .into_iter()
-                    .map(|(t, event)| ((t * f64::from(o.rate)).round() as u64, event))
-                    .collect();
-            } else if o.seconds.is_none() {
-                // The clips, and a second for the sound to die away.
-                frames = session.sequence_end(rate) as usize + o.rate as usize;
+                    .map(|(t, event)| (seconds(t) as u64, event))
+                    .collect::<Vec<_>>();
             }
+            // To the end of the last event, then until the sound dies away;
+            // or as long as --seconds says.
+            let end = demo.last().map_or(session.sequence_end(rate), |e| e.0 + 1) as usize;
+            let (frames, tail) = match o.seconds {
+                Some(s) => (
+                    seconds(s),
+                    Tail {
+                        threshold: 0.0,
+                        ..TAIL
+                    },
+                ),
+                None => (
+                    end,
+                    Tail {
+                        quiet_frames: seconds(TAIL_QUIET_SECONDS),
+                        max_frames: seconds(TAIL_MAX_SECONDS),
+                        ..TAIL
+                    },
+                ),
+            };
+            let (took, told) = session.set_offline(true);
+            println!("{took} of {told} plugins render offline");
             let mut mixer = session.mixer(rate, block, live, &demo)?;
-            let out = render_offline(&mut mixer, rate, channels, frames, block, &[]);
+            let render = render_until_quiet(&mut mixer, rate, channels, frames, block, &[], tail);
             if mixer.has_failed() {
                 return Err("a plugin failed while processing".into());
             }
             drop(mixer);
-            out
+            if !render.died_away {
+                println!(
+                    "the sound had not died away {TAIL_MAX_SECONDS} s after the end; cut there"
+                );
+            }
+            render.samples
         }
     };
 
@@ -664,20 +715,16 @@ fn render(path: &str, o: &Options) -> Result<()> {
         })
         .collect();
     let written = samples.len() / channels;
-    let spec = hound::WavSpec {
-        channels: o.channels,
-        sample_rate: o.rate,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
-    };
-    let mut writer = hound::WavWriter::create(path, spec)?;
-    for s in samples {
-        writer.write_sample(s)?;
-    }
-    writer.finalize()?;
+    wav::write(Path::new(path), &samples, o.channels, o.rate, format)?;
     println!(
-        "wrote {written} frames to {path}, peak {peak:.3} (channels: {})",
+        "wrote {written} frames ({:.3} s, {}) to {path}, peak {peak:.3} (channels: {})",
+        written as f64 / f64::from(o.rate),
+        format.describe(),
         by_channel.join(" ")
     );
+    let over = wav::over_full_scale(&samples);
+    if over > 0 && format != wav::Format::Float32 {
+        println!("{over} samples went beyond full scale and were clipped");
+    }
     Ok(())
 }

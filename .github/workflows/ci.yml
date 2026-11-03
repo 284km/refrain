@@ -56,16 +56,38 @@ jobs:
           done
           cmp target/half-clap.wav target/half-vst3.wav
       # A project's clips play back exactly like the same phrase sent as
-      # events, in both formats.
+      # events, in both formats. Rendering goes on until the sound dies away:
+      # the last note ends at 1.8 s and fades out over 5 ms, so the file ends
+      # at 1.805 s.
       - name: Play back clips
         shell: bash
         run: |
           for f in clap vst3; do
-            cargo run -- render target/phrase-$f.wav --plugin tests/projects/phrase-$f.refrain --seconds 2
+            cargo run -- render target/phrase-$f.wav --plugin tests/projects/phrase-$f.refrain | tee target/phrase.log
+            grep -q "wrote 86639 frames" target/phrase.log
             cargo run -- render target/demo-$f.wav --plugin target/test-plugins/refrain-test-synth.$f
             cmp target/phrase-$f.wav target/demo-$f.wav
           done
           cmp target/phrase-clap.wav target/phrase-vst3.wav
+      # Integer files have the size their sample size gives, and dither is the
+      # same every time but changes the file.
+      - name: Render to 16 and 24 bits
+        shell: bash
+        run: |
+          phrase=tests/projects/phrase-vst3.refrain
+          cargo run -- render target/p16.wav --plugin $phrase --bits 16
+          cargo run -- render target/p24.wav --plugin $phrase --bits 24
+          cargo run -- render target/p16-dither.wav --plugin $phrase --bits 16 --dither
+          cargo run -- render target/p16-dither-again.wav --plugin $phrase --bits 16 --dither
+          # 86639 stereo frames, after a 44-byte header (68 for 24 bits).
+          test "$(wc -c < target/p16.wav)" -eq $((44 + 86639 * 2 * 2))
+          test "$(wc -c < target/p24.wav)" -eq $((68 + 86639 * 2 * 3))
+          cmp target/p16-dither.wav target/p16-dither-again.wav
+          # Not `! cmp`: bash's -e does not stop on a command that starts with !.
+          if cmp -s target/p16.wav target/p16-dither.wav; then
+            echo "dither did not change the file" >&2
+            exit 1
+          fi
       # Tracks put together with the project commands mix the same in both
       # formats, and the same as the projects kept here. Soloing, muting and
       # removing an effect take the mix apart again.
@@ -87,6 +109,8 @@ jobs:
             cargo run -- render target/mix-$f.wav --plugin $m | tee target/mix.log
             # The master's effect clips at 0.25.
             grep -q "peak 0.250" target/mix.log
+            # Both instruments and both effects were told it is not real time.
+            grep -q "4 of 4 plugins render offline" target/mix.log
             cargo run -- render target/mix-kept-$f.wav --plugin tests/projects/mix-$f.refrain
             cmp target/mix-$f.wav target/mix-kept-$f.wav
             # Saving again keeps every plugin's state, the effects' too.
@@ -96,7 +120,7 @@ jobs:
             # Track 1 alone, without the master's effect, is the phrase.
             cargo run -- fx remove $m 1 --master
             cargo run -- mix $m --track 1 --solo
-            cargo run -- render target/solo-$f.wav --plugin $m --seconds 2
+            cargo run -- render target/solo-$f.wav --plugin $m
             cmp target/solo-$f.wav target/phrase-$f.wav
             # Track 2 alone: clipped at 0.25 by its effect, then 6 dB down,
             # and the right turned down by half more by the pan.

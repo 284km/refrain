@@ -161,7 +161,27 @@ impl Session {
 
     /// The frame just after the last event of any clip, at `sample_rate`.
     pub fn sequence_end(&self, sample_rate: f32) -> u64 {
-        self.tempo().frame_at(self.project.end(), sample_rate)
+        let tempo = self.tempo();
+        self.project
+            .tracks
+            .iter()
+            .filter_map(|t| t.sequence().last().map(|e| e.0))
+            .map(|tick| tempo.frame_at(tick, sample_rate) + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Tells every plugin whether it renders offline. Call before
+    /// [`mixer`](Self::mixer). Returns how many took the mode, and how many
+    /// were told.
+    pub fn set_offline(&mut self, offline: bool) -> (usize, usize) {
+        let mut took = 0;
+        let mut told = 0;
+        for p in self.plugins_mut() {
+            took += usize::from(p.set_offline(offline));
+            told += 1;
+        }
+        (took, told)
     }
 
     /// Checks that track `index` exists.

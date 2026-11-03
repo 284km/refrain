@@ -175,23 +175,104 @@ pub fn render_offline(
 ) -> Vec<f32> {
     assert!(channels > 0 && (1..=MAX_BLOCK_FRAMES).contains(&block_frames));
     assert!(events.is_sorted_by_key(|e| e.frame), "events out of order");
+    let tail = Tail {
+        threshold: 0.0,
+        quiet_frames: 0,
+        max_frames: 0,
+    };
+    render_until_quiet(
+        processor,
+        sample_rate,
+        channels,
+        frames,
+        block_frames,
+        events,
+        tail,
+    )
+    .samples
+}
+
+/// How long to go on rendering after the end, for the sound to die away.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tail {
+    /// A sample whose size is at most this is quiet.
+    pub threshold: f32,
+    /// The sound has died away once this many frames in a row are quiet.
+    pub quiet_frames: usize,
+    /// The most frames to render after the end.
+    pub max_frames: usize,
+}
+
+/// What [`render_until_quiet`] rendered.
+pub struct Render {
+    /// Interleaved frames.
+    pub samples: Vec<f32>,
+    /// False when the sound was still going after the longest tail.
+    pub died_away: bool,
+}
+
+/// Like [`render_offline`], and then goes on past `frames` until the sound
+/// dies away, or for at most `tail.max_frames`. The quiet frames at the end
+/// are cut off, though never the first `frames`.
+///
+/// What is rendered does not depend on the block size, and neither does
+/// where it ends.
+pub fn render_until_quiet(
+    processor: &mut dyn Processor,
+    sample_rate: f32,
+    channels: usize,
+    frames: usize,
+    block_frames: usize,
+    events: &[TimedEvent],
+    tail: Tail,
+) -> Render {
+    assert!(channels > 0 && (1..=MAX_BLOCK_FRAMES).contains(&block_frames));
+    assert!(events.is_sorted_by_key(|e| e.frame), "events out of order");
     processor.prepare(sample_rate, block_frames);
-    let mut out = vec![0.0; frames * channels];
+    let limit = frames + tail.max_frames;
+    let mut out = Vec::with_capacity(frames * channels);
     let mut pending = events.iter().peekable();
     let mut block_events = Vec::with_capacity(MAX_BLOCK_EVENTS);
-    for (index, block) in out.chunks_mut(block_frames * channels).enumerate() {
-        let start = index * block_frames;
-        let end = start + block.len() / channels;
+    let mut start = 0;
+    // The frame after the last loud one, and how many quiet frames follow it.
+    let mut loud_end = 0;
+    let mut quiet = 0;
+    loop {
+        let past_the_end = start >= frames;
+        if past_the_end && (quiet >= tail.quiet_frames || start >= limit) {
+            break;
+        }
+        // Blocks line up with the block size from the start, so the first
+        // `frames` are cut into blocks as `render_offline` cuts them.
+        let until = if past_the_end { limit } else { frames };
+        let n = block_frames.min(until - start);
+        let end = start + n;
         block_events.clear();
         while let Some(e) = pending.next_if(|e| (e.frame as usize) < end) {
             block_events.push(TimedEvent {
-                frame: (e.frame as usize - start) as u32,
+                frame: (e.frame as usize).saturating_sub(start) as u32,
                 event: e.event,
             });
         }
+        out.resize(end * channels, 0.0);
+        let block = &mut out[start * channels..];
         processor.process(block, channels, &block_events);
+        for (i, frame) in block.chunks_exact(channels).enumerate() {
+            if frame.iter().any(|s| s.abs() > tail.threshold) {
+                loud_end = start + i + 1;
+                quiet = 0;
+            } else {
+                quiet += 1;
+            }
+        }
+        start = end;
     }
-    out
+    let died_away = quiet >= tail.quiet_frames || frames >= limit;
+    out.truncate(loud_end.max(frames) * channels);
+    Render {
+        samples: out,
+        died_away,
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +353,93 @@ mod tests {
         let mut three = [9.0; 3];
         deinterleave(&[0.1, 0.2], 2, &mut three, 3, 1);
         assert_eq!(three, [0.1, 0.2, 0.0]);
+    }
+
+    /// Starts at `level` and decays by `factor` every frame.
+    struct Decay {
+        level: f32,
+        factor: f32,
+        start: f32,
+    }
+
+    impl Processor for Decay {
+        fn prepare(&mut self, _: f32, _: usize) {
+            self.level = self.start;
+        }
+        fn process(&mut self, out: &mut [f32], channels: usize, _: &[TimedEvent]) {
+            for frame in out.chunks_exact_mut(channels) {
+                frame.fill(self.level);
+                self.level *= self.factor;
+            }
+        }
+    }
+
+    fn decay() -> Decay {
+        Decay {
+            level: 1.0,
+            factor: 0.5,
+            start: 1.0,
+        }
+    }
+
+    const TAIL: Tail = Tail {
+        threshold: 0.001,
+        quiet_frames: 100,
+        max_frames: 10_000,
+    };
+
+    #[test]
+    fn the_tail_ends_where_the_sound_dies_away() {
+        // 0.5^9 is above 0.001 and 0.5^10 is not: ten loud frames.
+        for block in [1, 3, 128, 1_024] {
+            let r = render_until_quiet(&mut decay(), RATE, 2, 4, block, &[], TAIL);
+            assert!(r.died_away);
+            assert_eq!(r.samples.len(), 10 * 2, "block size {block}");
+            assert_eq!(r.samples[18], 0.5f32.powi(9));
+        }
+        // The frames asked for are kept, quiet or not.
+        let r = render_until_quiet(&mut decay(), RATE, 1, 50, 16, &[], TAIL);
+        assert_eq!(r.samples.len(), 50);
+    }
+
+    #[test]
+    fn a_sound_that_never_dies_away_stops_at_the_longest_tail() {
+        let mut sine = Sine::new(440.0, 0.5);
+        let r = render_until_quiet(&mut sine, RATE, 1, 1_000, 128, &[], TAIL);
+        assert!(!r.died_away);
+        assert_eq!(r.samples.len(), 1_000 + TAIL.max_frames);
+        // The first frames are what render_offline gives.
+        let plain = render_offline(&mut Sine::new(440.0, 0.5), RATE, 1, 1_000, 128, &[]);
+        assert_eq!(r.samples[..1_000], plain[..]);
+    }
+
+    /// Loud for 10 frames, quiet for `gap`, then loud for 10 more.
+    struct Gap(usize, usize);
+
+    impl Processor for Gap {
+        fn prepare(&mut self, _: f32, _: usize) {
+            self.1 = 0;
+        }
+        fn process(&mut self, out: &mut [f32], _: usize, _: &[TimedEvent]) {
+            for s in out {
+                let t = self.1;
+                *s = if t < 10 || (10 + self.0..20 + self.0).contains(&t) {
+                    0.5
+                } else {
+                    0.0
+                };
+                self.1 += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn a_pause_shorter_than_the_quiet_window_is_not_the_end() {
+        let r = render_until_quiet(&mut Gap(50, 0), RATE, 1, 1, 32, &[], TAIL);
+        assert_eq!(r.samples.len(), 70);
+        // A longer pause is.
+        let r = render_until_quiet(&mut Gap(200, 0), RATE, 1, 1, 32, &[], TAIL);
+        assert_eq!(r.samples.len(), 10);
     }
 
     /// Records the events it is given, with frames counted from the start.

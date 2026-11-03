@@ -72,6 +72,25 @@ thread_local! {
     // `edit_from_editor`. Tests run on threads of their own, so each sees
     // only the plugins it made.
     static HANDLERS: RefCell<Vec<ComPtr<IComponentHandler>>> = const { RefCell::new(Vec::new()) };
+    // The process mode of the last setupProcessing on this thread.
+    static PROCESS_MODE: Cell<Option<i32>> = const { Cell::new(None) };
+}
+
+/// Whether the last plugin set up on this thread was set up to render
+/// offline: `None` if none was set up. For tests.
+///
+/// The plugins also fail any block whose process mode differs from the one
+/// they were set up with, so a host cannot set up one mode and run another.
+pub fn set_up_offline() -> Option<bool> {
+    PROCESS_MODE
+        .get()
+        .map(|m| m == ProcessModes_::kOffline as int32)
+}
+
+/// Remembers the mode a plugin is set up with, and returns it.
+fn note_process_mode(setup: &ProcessSetup) -> i32 {
+    PROCESS_MODE.set(Some(setup.processMode));
+    setup.processMode
 }
 
 /// Does what turning a knob in the plugin's editor does: tells the host,
@@ -182,6 +201,7 @@ struct SynthProcessor {
     volume: AtomicU32,
     // Filled and sorted in process(); allocated in setupProcessing().
     changes: RefCell<Vec<(i32, Change)>>,
+    process_mode: Cell<i32>,
 }
 
 impl Class for SynthProcessor {
@@ -195,6 +215,7 @@ impl SynthProcessor {
             tone: RefCell::new(Tone::new(48_000.0)),
             volume: AtomicU32::new(1f32.to_bits()),
             changes: RefCell::new(Vec::with_capacity(MAX_CHANGES)),
+            process_mode: Cell::new(ProcessModes_::kRealtime as int32),
         }
     }
 
@@ -458,6 +479,7 @@ impl IAudioProcessorTrait for SynthProcessor {
 
     unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
         let setup = unsafe { &*setup };
+        self.process_mode.set(note_process_mode(setup));
         *self.tone.borrow_mut() = Tone::new(setup.sampleRate);
         kResultOk
     }
@@ -471,6 +493,9 @@ impl IAudioProcessorTrait for SynthProcessor {
 
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
         let data = unsafe { &*data };
+        if data.processMode != self.process_mode.get() {
+            return kResultFalse;
+        }
         unsafe { self.collect(data) };
         let frames = data.numSamples.max(0) as usize;
         if data.numOutputs < 1 || data.outputs.is_null() {

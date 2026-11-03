@@ -108,6 +108,17 @@ cargo run -- record band.refrain --track 1                # MIDI goes to track 1
 cargo run -- editor band.refrain --track 2 --fx 1 --save band.refrain   # an effect's editor
 ```
 
+`render` writes a project to a WAV file. It goes on past the last note until
+the sound has died away, then cuts the silence off; `--seconds` gives a fixed
+length instead. Plugins are told the render is not in real time, so they may
+use their best quality. Files are 32-bit float unless `--bits` says 16 or 24;
+`--dither` adds triangular dither to those.
+
+```sh
+cargo run -- render band.wav --plugin band.refrain --bits 24
+cargo run -- render band-cd.wav --plugin band.refrain --bits 16 --dither --rate 44100
+```
+
 An installed instrument or effect works the same way: pass its `.clap` or `.vst3`
 file or bundle. When a file holds several plugins, `--id` chooses one
 (for VST3, by name or class ID). Loading a plugin runs its code inside refrain.

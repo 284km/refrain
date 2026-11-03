@@ -118,6 +118,7 @@ pub struct Vst3Plugin {
     _handler: ComWrapper<ComponentHandler>,
     info: Vst3Info,
     active: bool,
+    offline: bool,
     // Held by the processor; the plugin is only torn down once it is gone.
     alive: Arc<()>,
     module: Vst3Module,
@@ -187,6 +188,7 @@ impl Vst3Plugin {
             _host: host,
             info,
             active: false,
+            offline: false,
             alive: Arc::new(()),
             module: module.clone(),
             _handler: handler,
@@ -211,6 +213,13 @@ impl Vst3Plugin {
 
     pub fn info(&self) -> &Vst3Info {
         &self.info
+    }
+
+    /// Whether the plugin renders offline, as when writing a file: it then
+    /// need not keep up with real time. Takes effect when the plugin is next
+    /// activated.
+    pub fn set_offline(&mut self, offline: bool) {
+        self.offline = offline;
     }
 
     /// Activates the plugin for a sample rate and a largest block size.
@@ -277,8 +286,13 @@ impl Vst3Plugin {
             }
         }
 
+        let process_mode = if self.offline {
+            ProcessModes_::kOffline
+        } else {
+            ProcessModes_::kRealtime
+        } as int32;
         let mut setup = ProcessSetup {
-            processMode: ProcessModes_::kRealtime as int32,
+            processMode: process_mode,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32 as int32,
             maxSamplesPerBlock: max_block_frames as int32,
             sampleRate: f64::from(sample_rate),
@@ -296,6 +310,7 @@ impl Vst3Plugin {
 
         Ok(Vst3Processor::new(
             self.processor.clone(),
+            process_mode,
             self.midi_map(),
             &inputs,
             &outputs,
@@ -542,6 +557,8 @@ const MAX_PARAMS: usize = 64;
 /// A running plugin, owned by the audio thread.
 pub struct Vst3Processor {
     processor: ComPtr<IAudioProcessor>,
+    // Real time or offline, as given in setupProcessing.
+    process_mode: int32,
     midi_map: Box<MidiMap>,
     sample_rate: f32,
     max_block_frames: usize,
@@ -575,6 +592,7 @@ impl Vst3Processor {
     #[allow(clippy::too_many_arguments)]
     fn new(
         processor: ComPtr<IAudioProcessor>,
+        process_mode: int32,
         midi_map: Box<MidiMap>,
         inputs: &[i32],
         outputs: &[i32],
@@ -603,6 +621,7 @@ impl Vst3Processor {
         context.state = state;
         let mut p = Self {
             processor,
+            process_mode,
             midi_map,
             sample_rate,
             max_block_frames,
@@ -792,7 +811,7 @@ impl Processor for Vst3Processor {
         }
 
         let mut data = ProcessData {
-            processMode: ProcessModes_::kRealtime as int32,
+            processMode: self.process_mode,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32 as int32,
             numSamples: frames as int32,
             numInputs: self.input_buses.len() as int32,

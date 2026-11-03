@@ -18,6 +18,27 @@
 
 mod effect;
 
+use std::cell::Cell;
+
+use clack_extensions::render::{PluginRender, PluginRenderImpl, RenderMode};
+
+thread_local! {
+    // The render mode the host last set on a plugin on this thread. Tests run
+    // on threads of their own, so each sees only the plugins it made.
+    static RENDER_MODE: Cell<Option<RenderMode>> = const { Cell::new(None) };
+}
+
+/// Whether the host last told a test plugin on this thread to render
+/// offline: `None` if it never said. For tests.
+pub fn told_offline() -> Option<bool> {
+    RENDER_MODE.get().map(|m| m == RenderMode::Offline)
+}
+
+fn set_render_mode(mode: RenderMode) -> Result<(), PluginError> {
+    RENDER_MODE.set(Some(mode));
+    Ok(())
+}
+
 use std::cell::RefCell;
 use std::ffi::CStr;
 use std::io::{Read, Write};
@@ -67,7 +88,8 @@ impl Plugin for TestSynth {
             .register::<PluginAudioPorts>()
             .register::<PluginNotePorts>()
             .register::<PluginGui>()
-            .register::<PluginState>();
+            .register::<PluginState>()
+            .register::<PluginRender>();
     }
 }
 
@@ -374,6 +396,16 @@ impl PluginGuiImpl for SynthMainThread<'_> {
 
     fn hide(&self) -> Result<(), PluginError> {
         Ok(())
+    }
+}
+
+impl PluginRenderImpl for SynthMainThread<'_> {
+    fn has_hard_realtime_requirement(&self) -> bool {
+        false
+    }
+
+    fn set(&self, mode: RenderMode) -> Result<(), PluginError> {
+        set_render_mode(mode)
     }
 }
 
