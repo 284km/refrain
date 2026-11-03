@@ -10,7 +10,8 @@ use egui::{
 use refrain_engine::{Event, Tempo};
 use refrain_project::{Mix, Track};
 
-use crate::session::Slot;
+use crate::plugin::Choice;
+use crate::session::{Chain, Slot};
 
 /// Everything the window shows.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -33,6 +34,40 @@ pub struct Model {
     pub dirty: bool,
     /// The latest thing worth telling, such as an error.
     pub status: String,
+    /// Choosing a plugin to add, when that is going on.
+    pub chooser: Option<ChooserView>,
+}
+
+/// What a plugin being chosen is for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Purpose {
+    /// The instrument of a new track.
+    Track,
+    /// An effect at the end of a chain.
+    Effect(Chain),
+}
+
+/// The plugin chooser: plugin files to pick from, and once one is picked,
+/// the plugins it holds.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChooserView {
+    pub purpose: Option<Purpose>,
+    /// Shows only files whose path contains this, ignoring case.
+    pub filter: String,
+    pub files: Vec<FileView>,
+    /// The file picked, by its index in `files`.
+    pub file: Option<usize>,
+    pub plugins: Vec<Choice>,
+    /// What is typed as a path.
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FileView {
+    pub path: String,
+    /// Already used by this project, rather than found where plugins are
+    /// installed.
+    pub in_project: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -60,7 +95,7 @@ pub struct NoteView {
 }
 
 /// What the person asked for.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Play,
     Stop,
@@ -75,6 +110,24 @@ pub enum Action {
     MasterVolume(f32),
     OpenEditor(Slot),
     Save,
+    SaveAs,
+    New,
+    Open,
+    /// Start choosing a plugin for this.
+    Choose(Purpose),
+    Filter(String),
+    /// What is typed in the chooser's path field.
+    TypePath(String),
+    /// A file of the chooser's list, by index.
+    PickFile(usize),
+    /// A file named by its path, typed or chosen in the system's dialog
+    /// (`None`).
+    PickPath(Option<String>),
+    /// A plugin of the file picked, by index.
+    PickPlugin(usize),
+    CloseChooser,
+    RemoveTrack(usize),
+    RemoveEffect(Chain, usize),
 }
 
 impl TrackView {
@@ -227,9 +280,24 @@ fn transport(ui: &mut Ui, model: &Model, actions: &mut Vec<Action>) {
         }
         ui.monospace(model.position());
         ui.separator();
+        for (label, action) in [("New", Action::New), ("Open…", Action::Open)] {
+            if ui.add_enabled(stopped, egui::Button::new(label)).clicked() {
+                actions.push(action);
+            }
+        }
         let save = if model.dirty { "Save*" } else { "Save" };
         if ui.button(save).clicked() {
             actions.push(Action::Save);
+        }
+        if ui.button("Save as…").clicked() {
+            actions.push(Action::SaveAs);
+        }
+        ui.separator();
+        if ui
+            .add_enabled(stopped, egui::Button::new("Add track"))
+            .clicked()
+        {
+            actions.push(Action::Choose(Purpose::Track));
         }
         ui.label(&model.status);
     });
@@ -246,11 +314,138 @@ fn master(ui: &mut Ui, model: &Model, actions: &mut Vec<Action>) {
             actions.push(Action::MasterVolume(db));
         }
         for (k, name) in model.master_effects.iter().enumerate() {
-            if ui.button(name).on_hover_text("open its editor").clicked() {
-                actions.push(Action::OpenEditor(Slot::Master(k)));
-            }
+            effect_button(ui, model, name, Chain::Master, k, actions);
+        }
+        add_effect_button(ui, model, Chain::Master, actions);
+    });
+    if let Some(chooser) = &model.chooser {
+        chooser_window(ui, chooser, actions);
+    }
+}
+
+/// An effect's button: it opens the editor, and its menu removes it.
+fn effect_button(
+    ui: &mut Ui,
+    model: &Model,
+    name: &str,
+    chain: Chain,
+    k: usize,
+    actions: &mut Vec<Action>,
+) {
+    let slot = match chain {
+        Chain::Track(t) => Slot::Effect(t, k),
+        Chain::Master => Slot::Master(k),
+    };
+    let response = ui
+        .button(name)
+        .on_hover_text("open its editor; right-click for more");
+    if response.clicked() {
+        actions.push(Action::OpenEditor(slot));
+    }
+    response.context_menu(|ui| {
+        if ui
+            .add_enabled(!model.playing, egui::Button::new("Remove effect"))
+            .clicked()
+        {
+            actions.push(Action::RemoveEffect(chain, k));
         }
     });
+}
+
+fn add_effect_button(ui: &mut Ui, model: &Model, chain: Chain, actions: &mut Vec<Action>) {
+    let add = egui::Button::new("+ effect");
+    if ui
+        .add_enabled(!model.playing, add)
+        .on_hover_text("add an effect at the end")
+        .clicked()
+    {
+        actions.push(Action::Choose(Purpose::Effect(chain)));
+    }
+}
+
+/// The plugin chooser, in a window of its own over the main one.
+fn chooser_window(ui: &mut Ui, chooser: &ChooserView, actions: &mut Vec<Action>) {
+    let title = match chooser.purpose {
+        Some(Purpose::Track) | None => "Choose an instrument for a new track",
+        Some(Purpose::Effect(Chain::Master)) => "Choose an effect for the master",
+        Some(Purpose::Effect(Chain::Track(_))) => "Choose an effect for the track",
+    };
+    egui::Window::new(title)
+        .collapsible(false)
+        .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        .default_size(vec2(560.0, 420.0))
+        .show(ui.ctx(), |ui| {
+            let mut filter = chooser.filter.clone();
+            ui.horizontal(|ui| {
+                ui.label("Find");
+                let edit = egui::TextEdit::singleline(&mut filter).hint_text("part of a path");
+                if ui.add(edit).changed() {
+                    actions.push(Action::Filter(filter.clone()));
+                }
+            });
+            let needle = chooser.filter.to_lowercase();
+            egui::ScrollArea::vertical()
+                .max_height(200.0)
+                .id_salt("files")
+                .show(ui, |ui| {
+                    let shown = chooser
+                        .files
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, f)| f.path.to_lowercase().contains(&needle));
+                    let mut any = false;
+                    for (i, file) in shown {
+                        any = true;
+                        let label = if file.in_project {
+                            format!("{} (in this project)", file.path)
+                        } else {
+                            file.path.clone()
+                        };
+                        if ui
+                            .selectable_label(chooser.file == Some(i), label)
+                            .clicked()
+                        {
+                            actions.push(Action::PickFile(i));
+                        }
+                    }
+                    if !any {
+                        ui.weak("No plugin files found here.");
+                    }
+                });
+            ui.horizontal(|ui| {
+                let mut path = chooser.path.clone();
+                let edit = egui::TextEdit::singleline(&mut path)
+                    .hint_text("or a path to a .clap or .vst3");
+                if ui.add(edit).changed() {
+                    actions.push(Action::TypePath(path));
+                }
+                let typed = !chooser.path.is_empty();
+                if ui.add_enabled(typed, egui::Button::new("Use")).clicked() {
+                    actions.push(Action::PickPath(Some(chooser.path.clone())));
+                }
+                if ui.button("Other file…").clicked() {
+                    actions.push(Action::PickPath(None));
+                }
+            });
+            if !chooser.plugins.is_empty() {
+                ui.separator();
+                ui.label("Plugins in this file:");
+                for (i, plugin) in chooser.plugins.iter().enumerate() {
+                    let kind = if plugin.effect {
+                        "effect"
+                    } else {
+                        "instrument"
+                    };
+                    if ui.button(format!("{}  ({kind})", plugin.name)).clicked() {
+                        actions.push(Action::PickPlugin(i));
+                    }
+                }
+            }
+            ui.separator();
+            if ui.button("Cancel").clicked() {
+                actions.push(Action::CloseChooser);
+            }
+        });
 }
 
 /// The ruler and one row per track: its header, then its lane of clips.
@@ -300,7 +495,17 @@ fn header(ui: &mut Ui, model: &Model, t: usize, track: &TrackView, actions: &mut
         {
             actions.push(Action::LiveTrack(t));
         }
-        ui.strong(&track.name);
+        let name = ui
+            .add(egui::Label::new(egui::RichText::new(&track.name).strong()).sense(Sense::click()))
+            .on_hover_text("right-click for more");
+        name.context_menu(|ui| {
+            if ui
+                .add_enabled(!model.playing, egui::Button::new("Remove track"))
+                .clicked()
+            {
+                actions.push(Action::RemoveTrack(t));
+            }
+        });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let mut mix = track.mix;
             if ui.toggle_value(&mut mix.solo, "S").changed() {
@@ -330,10 +535,9 @@ fn header(ui: &mut Ui, model: &Model, t: usize, track: &TrackView, actions: &mut
             actions.push(Action::OpenEditor(Slot::Instrument(t)));
         }
         for (k, name) in track.effects.iter().enumerate() {
-            if ui.button(name).on_hover_text("open its editor").clicked() {
-                actions.push(Action::OpenEditor(Slot::Effect(t, k)));
-            }
+            effect_button(ui, model, name, Chain::Track(t), k, actions);
         }
+        add_effect_button(ui, model, Chain::Track(t), actions);
     });
 }
 
@@ -473,6 +677,7 @@ mod tests {
             click: true,
             dirty: false,
             status: String::new(),
+            chooser: None,
         }
     }
 
@@ -592,14 +797,170 @@ mod tests {
         assert_eq!(model.position(), "bar 1 beat 2   0:00.500");
     }
 
+    #[test]
+    fn project_buttons_ask_for_what_they_say() {
+        assert_eq!(after_click(model(), "New"), [Action::New]);
+        assert_eq!(after_click(model(), "Open…"), [Action::Open]);
+        assert_eq!(after_click(model(), "Save as…"), [Action::SaveAs]);
+        assert_eq!(
+            after_click(model(), "Add track"),
+            [Action::Choose(Purpose::Track)]
+        );
+        // Not while playing: the plugins would have to stop.
+        let playing = Model {
+            playing: true,
+            ..model()
+        };
+        assert!(after_click(playing.clone(), "Add track").is_empty());
+        assert!(after_click(playing, "New").is_empty());
+    }
+
+    /// Clicks every widget with `label`, one after the other, and returns
+    /// what was asked for, sorted.
+    fn click_all(harness: &mut Harness<'static, State>, label: &str) -> Vec<Action> {
+        let count = harness.get_all_by_label(label).count();
+        for i in 0..count {
+            harness.get_all_by_label(label).nth(i).unwrap().click();
+            harness.run();
+        }
+        let mut actions = std::mem::take(&mut harness.state_mut().1);
+        actions.sort_by_key(|a| format!("{a:?}"));
+        actions
+    }
+
+    #[test]
+    fn effects_are_added_at_the_end_of_a_track_or_the_master() {
+        let mut harness = harness(model());
+        assert_eq!(
+            click_all(&mut harness, "+ effect"),
+            [
+                Action::Choose(Purpose::Effect(Chain::Master)),
+                Action::Choose(Purpose::Effect(Chain::Track(0))),
+                Action::Choose(Purpose::Effect(Chain::Track(1))),
+            ]
+        );
+    }
+
+    #[test]
+    fn menus_remove_tracks_and_effects() {
+        use egui::accesskit::Role;
+        let mut harness = harness(model());
+        harness
+            .get_all_by_role_and_label(Role::Label, "refrain test synth")
+            .nth(1)
+            .unwrap()
+            .click_secondary();
+        harness.run();
+        harness.get_by_label("Remove track").click();
+        harness.run();
+        assert_eq!(harness.state().1, [Action::RemoveTrack(1)]);
+
+        let mut harness = self::harness(model());
+        // The master's effect comes first.
+        harness
+            .get_all_by_label("refrain test effect")
+            .nth(1)
+            .unwrap()
+            .click_secondary();
+        harness.run();
+        harness.get_by_label("Remove effect").click();
+        harness.run();
+        assert_eq!(
+            harness.state().1,
+            [Action::RemoveEffect(Chain::Track(1), 0)]
+        );
+    }
+
+    fn choosing() -> Model {
+        Model {
+            chooser: Some(ChooserView {
+                purpose: Some(Purpose::Effect(Chain::Track(0))),
+                files: vec![
+                    FileView {
+                        path: "plugins/synth.clap".into(),
+                        in_project: true,
+                    },
+                    FileView {
+                        path: "plugins/Delay.vst3".into(),
+                        in_project: false,
+                    },
+                ],
+                ..ChooserView::default()
+            }),
+            ..model()
+        }
+    }
+
+    #[test]
+    fn the_chooser_picks_files_and_then_plugins() {
+        assert_eq!(
+            after_click(choosing(), "plugins/Delay.vst3"),
+            [Action::PickFile(1)]
+        );
+        assert_eq!(
+            after_click(choosing(), "plugins/synth.clap (in this project)"),
+            [Action::PickFile(0)]
+        );
+        assert_eq!(after_click(choosing(), "Cancel"), [Action::CloseChooser]);
+        assert_eq!(
+            after_click(choosing(), "Other file…"),
+            [Action::PickPath(None)]
+        );
+
+        // A filter hides what does not match.
+        let mut filtered = choosing();
+        filtered.chooser.as_mut().unwrap().filter = "DELAY".into();
+        let harness = harness(filtered);
+        assert!(harness.query_by_label("plugins/Delay.vst3").is_some());
+        assert!(
+            harness
+                .query_by_label("plugins/synth.clap (in this project)")
+                .is_none()
+        );
+
+        // A typed path is used as it is.
+        let mut typed = choosing();
+        typed.chooser.as_mut().unwrap().path = "my/Reverb.clap".into();
+        assert_eq!(
+            after_click(typed, "Use"),
+            [Action::PickPath(Some("my/Reverb.clap".into()))]
+        );
+
+        // Once a file is picked, its plugins are there to pick.
+        let mut picked = choosing();
+        let chooser = picked.chooser.as_mut().unwrap();
+        chooser.file = Some(0);
+        chooser.plugins = vec![
+            Choice {
+                id: "e".into(),
+                name: "refrain test effect".into(),
+                effect: true,
+            },
+            Choice {
+                id: "s".into(),
+                name: "refrain test synth".into(),
+                effect: false,
+            },
+        ];
+        assert_eq!(
+            after_click(picked, "refrain test synth  (instrument)"),
+            [Action::PickPlugin(1)]
+        );
+    }
+
     /// Writes what the window looks like to target/gui-preview.png, for a
     /// person to look at: `cargo test -p refrain preview -- --ignored`.
     #[test]
     #[ignore = "writes a picture; run by hand"]
     fn preview() {
-        let mut harness = harness_with(model(), true);
-        let image = harness.render().unwrap();
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/gui-preview.png");
-        image.save(path).unwrap();
+        let target = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target");
+        for (model, name) in [
+            (model(), "gui-preview.png"),
+            (choosing(), "gui-chooser.png"),
+        ] {
+            let mut harness = harness_with(model, true);
+            let image = harness.render().unwrap();
+            image.save(format!("{target}/{name}")).unwrap();
+        }
     }
 }

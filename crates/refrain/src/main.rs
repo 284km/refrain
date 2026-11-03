@@ -43,8 +43,9 @@ usage:
   refrain record <plugin> [options]     like play, and record what comes in from MIDI
                                         as a new clip; needs --save, or a project
   refrain editor <plugin> [options]     open a plugin's editor, without audio
-  refrain gui <project> [options]       open refrain's window on a project, or on a
-                                        plugin; --save says where to save
+  refrain gui [project] [options]       open refrain's window on a project, on a
+                                        plugin, or on a new project; --save says
+                                        where to save
   refrain render <out.wav> [options]    write a sine wave, or with --plugin a
                                         project's clips or else a short phrase, to
                                         a WAV file: until the sound dies away, and
@@ -153,7 +154,8 @@ fn run(args: &[String]) -> Result<()> {
         ["record", path] => record(path, &o),
         ["editor", path] => editor_only(path, &o),
         ["render", path] => render(path, &o),
-        ["gui", path] => gui::run(Path::new(path), &o),
+        ["gui"] => gui::run(None, &o),
+        ["gui", path] => gui::run(Some(Path::new(path)), &o),
         ["new", path] => project::new(Path::new(path), &o),
         ["show", path] => project::show(Path::new(path)),
         ["track", "add", path, plugin] => {

@@ -24,8 +24,14 @@ egui-winit = { version = "0.37", default-features = false }
 egui-wgpu = { version = "0.37", default-features = false, features = ["winit"] }
 wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "metal", "dx12"] }
 pollster = "0.4"
+# Native file dialogs. Its default features are for Linux desktops.
+rfd = { version = "0.17", default-features = false }
 
 [dev-dependencies]
+clack-host = { version = "0.2", features = ["clack-plugin"] }
+refrain-test-synth = { path = "../refrain-test-synth" }
+refrain-test-synth-vst3 = { path = "../refrain-test-synth-vst3" }
+refrain-test-tone = { path = "../refrain-test-tone" }
 egui_kittest = { version = "0.37", default-features = false, features = ["wgpu", "snapshot"] }
 
 [target.'cfg(windows)'.dependencies]

@@ -18,24 +18,29 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 use super::remote::{Command, Remote, Status};
-use super::view::{self, Action, Model, TrackView};
+use super::view::{self, Action, ChooserView, FileView, Model, Purpose, TrackView};
 use crate::audio::Output;
 use crate::editor::EditorWindow;
+use crate::plugin::{self, Choice, Kind};
 use crate::session::{Session, Slot};
 use crate::{Options, Result, midi};
 
-/// Opens the main window on the project, or plugin, at `path`, and runs until
-/// it closes.
-pub fn run(path: &Path, o: &Options) -> Result<()> {
-    // SAFETY: the user asked for this file to be loaded.
-    let session = unsafe { Session::open(path, o.id.as_deref()) }?;
-    let is_project = path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case(refrain_project::EXTENSION));
-    let save_to = match &o.save {
-        Some(save) => Some(PathBuf::from(save)),
-        None if is_project => Some(path.to_path_buf()),
-        None => None,
+/// Opens the main window on the project, or plugin, at `path`, or on a new
+/// project, and runs until it closes.
+pub fn run(path: Option<&Path>, o: &Options) -> Result<()> {
+    let session = match path {
+        // SAFETY: the user asked for this file to be loaded.
+        Some(path) => unsafe { Session::open(path, o.id.as_deref()) }?,
+        None => Session::empty(),
+    };
+    let is_project = path.is_some_and(|p| {
+        p.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(refrain_project::EXTENSION))
+    });
+    let save_to = match (&o.save, path) {
+        (Some(save), _) => Some(PathBuf::from(save)),
+        (None, Some(path)) if is_project => Some(path.to_path_buf()),
+        _ => None,
     };
     let (output, message) = match Output::open(o.device.as_deref()) {
         Ok(output) => {
@@ -45,27 +50,10 @@ pub fn run(path: &Path, o: &Options) -> Result<()> {
         Err(e) => (None, format!("no audio output, so nothing plays: {e}")),
     };
     println!("{message}");
-    let mut gui = Gui {
-        title: format!("refrain — {}", path.display()),
-        session,
-        save_to,
-        output,
-        audio: None,
-        status: Arc::new(Status::default()),
-        midi: o.midi.clone(),
-        recorded: None,
-        live: o.live_track(),
-        click: true,
-        dirty: false,
-        message,
-        take: None,
-        editors: Vec::new(),
-        to_open: Vec::new(),
-        window: None,
-        error: None,
-        stop_after: o.seconds.map(Duration::from_secs_f64),
-        started: Instant::now(),
-    };
+    let mut gui = Gui::new(session, save_to, output, message);
+    gui.midi = o.midi.clone();
+    gui.live = o.live_track();
+    gui.stop_after = o.seconds.map(Duration::from_secs_f64);
     if !gui.session.project.tracks.is_empty() {
         gui.session.check_track(gui.live)?;
     }
@@ -119,9 +107,68 @@ struct Gui {
     error: Option<Box<dyn std::error::Error>>,
     stop_after: Option<Duration>,
     started: Instant,
+    chooser: Option<Chooser>,
+    // The plugin files where plugins are installed, found once.
+    installed: Option<Vec<PathBuf>>,
+    // The action that would throw away unsaved changes, pressed once.
+    confirm: Option<&'static str>,
+    // How plugins are found and loaded; tests load them in-process.
+    list_file: ListFile,
+    open_plugin: OpenPlugin,
+}
+
+type ListFile = unsafe fn(&Path) -> Result<Vec<Choice>>;
+type OpenPlugin = unsafe fn(&Path, Option<&str>) -> Result<Kind>;
+
+/// The plugin chooser, while it is open.
+struct Chooser {
+    purpose: Purpose,
+    filter: String,
+    // Files, and whether the project already uses them.
+    files: Vec<(PathBuf, bool)>,
+    file: Option<usize>,
+    picked: Option<PathBuf>,
+    plugins: Vec<Choice>,
+    path: String,
 }
 
 impl Gui {
+    fn new(
+        session: Session,
+        save_to: Option<PathBuf>,
+        output: Option<Output>,
+        message: String,
+    ) -> Self {
+        let mut gui = Self {
+            title: String::new(),
+            session,
+            save_to,
+            output,
+            audio: None,
+            status: Arc::new(Status::default()),
+            midi: None,
+            recorded: None,
+            live: 0,
+            click: true,
+            dirty: false,
+            message,
+            take: None,
+            editors: Vec::new(),
+            to_open: Vec::new(),
+            window: None,
+            error: None,
+            stop_after: None,
+            started: Instant::now(),
+            chooser: None,
+            installed: None,
+            confirm: None,
+            list_file: plugin::list_file,
+            open_plugin: Kind::open,
+        };
+        gui.retitle();
+        gui
+    }
+
     fn rate(&self) -> f32 {
         self.output.as_ref().map_or(48_000.0, Output::sample_rate)
     }
@@ -232,10 +279,28 @@ impl Gui {
             } else {
                 self.message.clone()
             },
+            chooser: self.chooser.as_ref().map(|c| ChooserView {
+                purpose: Some(c.purpose),
+                filter: c.filter.clone(),
+                files: c
+                    .files
+                    .iter()
+                    .map(|(path, in_project)| FileView {
+                        path: path.display().to_string(),
+                        in_project: *in_project,
+                    })
+                    .collect(),
+                file: c.file,
+                plugins: c.plugins.clone(),
+                path: c.path.clone(),
+            }),
         }
     }
 
     fn act(&mut self, action: Action) {
+        if !matches!(action, Action::New | Action::Open) {
+            self.confirm = None;
+        }
         match action {
             Action::Play => self.send(Command::Play),
             Action::Stop => {
@@ -292,8 +357,249 @@ impl Gui {
                     self.to_open.push(slot);
                 }
             }
+            Action::Save if self.save_to.is_none() => self.save_as(),
             Action::Save => self.save(),
+            Action::SaveAs => self.save_as(),
+            Action::New => {
+                if self.may_discard("New") {
+                    self.replace(Session::empty(), None);
+                }
+            }
+            Action::Open => {
+                if self.may_discard("Open")
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("refrain project", &[refrain_project::EXTENSION])
+                        .pick_file()
+                {
+                    self.open_project(&path);
+                }
+            }
+            Action::Choose(purpose) => self.open_chooser(purpose),
+            Action::Filter(filter) => {
+                if let Some(c) = &mut self.chooser {
+                    c.filter = filter;
+                }
+            }
+            Action::TypePath(path) => {
+                if let Some(c) = &mut self.chooser {
+                    c.path = path;
+                }
+            }
+            Action::PickFile(i) => {
+                let Some(c) = &mut self.chooser else { return };
+                let Some((path, _)) = c.files.get(i) else {
+                    return;
+                };
+                let path = path.clone();
+                c.file = Some(i);
+                self.pick_path(path);
+            }
+            Action::PickPath(typed) => {
+                let path = match typed {
+                    Some(typed) => Some(PathBuf::from(typed)),
+                    None => rfd::FileDialog::new()
+                        .add_filter("CLAP or VST3 plugin", &["clap", "vst3"])
+                        .pick_file(),
+                };
+                if let Some(path) = path {
+                    if let Some(c) = &mut self.chooser {
+                        c.file = None;
+                    }
+                    self.pick_path(path);
+                }
+            }
+            Action::PickPlugin(i) => {
+                let Some(c) = &self.chooser else { return };
+                let (Some(path), Some(choice)) = (c.picked.clone(), c.plugins.get(i)) else {
+                    return;
+                };
+                let id = choice.id.clone();
+                self.add_plugin(&path, &id);
+            }
+            Action::CloseChooser => self.chooser = None,
+            Action::RemoveTrack(t) => {
+                let name = self.session.project.tracks.get(t).map(|t| t.name.clone());
+                if self.change(|s| s.remove_track(t)) {
+                    if self.live > t || self.live >= self.session.project.tracks.len() {
+                        self.live = self.live.saturating_sub(1);
+                    }
+                    self.message = format!("removed track {}: {}", t + 1, name.unwrap_or_default());
+                }
+            }
+            Action::RemoveEffect(chain, k) => {
+                if self.change(|s| s.remove_effect(chain, k)) {
+                    self.message = "removed the effect".into();
+                }
+            }
         }
+    }
+
+    /// Whether to go on with `what`, which throws away unsaved changes: yes
+    /// when there are none, or when it is pressed a second time.
+    fn may_discard(&mut self, what: &'static str) -> bool {
+        if !self.dirty || self.confirm == Some(what) {
+            self.confirm = None;
+            return true;
+        }
+        self.confirm = Some(what);
+        self.message = format!("there are unsaved changes; press {what} again to throw them away");
+        false
+    }
+
+    /// Changes the tracks or the effects: closes the editors, whose slots
+    /// may move, and puts the mixer together again around the change.
+    /// Returns whether it went through.
+    fn change(&mut self, f: impl FnOnce(&mut Session) -> Result<()>) -> bool {
+        while !self.editors.is_empty() {
+            self.close_editor(0);
+        }
+        let frame = self.stop_audio();
+        let result = f(&mut self.session);
+        if let Err(e) = &result {
+            self.message = e.to_string();
+        } else {
+            self.dirty = true;
+        }
+        self.start_audio(frame);
+        result.is_ok()
+    }
+
+    fn open_chooser(&mut self, purpose: Purpose) {
+        let installed = self.installed.get_or_insert_with(plugin::installed_files);
+        let in_project = self.session.plugin_files();
+        let mut files: Vec<(PathBuf, bool)> =
+            in_project.iter().map(|f| (f.clone(), true)).collect();
+        files.extend(
+            installed
+                .iter()
+                .filter(|f| !in_project.contains(f))
+                .map(|f| (f.clone(), false)),
+        );
+        self.chooser = Some(Chooser {
+            purpose,
+            filter: String::new(),
+            files,
+            file: None,
+            picked: None,
+            plugins: Vec::new(),
+            path: String::new(),
+        });
+    }
+
+    /// Lists the plugins in `path`. When it holds just one, that one is
+    /// added straight away.
+    fn pick_path(&mut self, path: PathBuf) {
+        // SAFETY: the person picked this file to load.
+        let mut plugins = match unsafe { (self.list_file)(&path) } {
+            Ok(plugins) if !plugins.is_empty() => plugins,
+            Ok(_) => {
+                self.message = format!("{} holds no plugins", path.display());
+                return;
+            }
+            Err(e) => {
+                self.message = format!("{}: {e}", path.display());
+                return;
+            }
+        };
+        let Some(c) = &mut self.chooser else { return };
+        // What the chooser is for comes first.
+        let want_effect = matches!(c.purpose, Purpose::Effect(_));
+        plugins.sort_by_key(|p| p.effect != want_effect);
+        if let [only] = plugins.as_slice() {
+            let id = only.id.clone();
+            self.add_plugin(&path, &id);
+            return;
+        }
+        c.picked = Some(path);
+        c.plugins = plugins;
+    }
+
+    /// Loads plugin `id` from `path` and adds it where the chooser said.
+    fn add_plugin(&mut self, path: &Path, id: &str) {
+        let Some(purpose) = self.chooser.as_ref().map(|c| c.purpose) else {
+            return;
+        };
+        // SAFETY: the person picked this plugin to load.
+        let kind = match unsafe { (self.open_plugin)(path, Some(id)) } {
+            Ok(kind) => kind,
+            Err(e) => {
+                self.message = format!("could not load {}: {e}", path.display());
+                return;
+            }
+        };
+        let name = kind.describe();
+        let added = self.change(|s| match purpose {
+            Purpose::Track => {
+                s.add_track(path, kind);
+                Ok(())
+            }
+            Purpose::Effect(chain) => s.add_effect(chain, path, kind),
+        });
+        if added {
+            if purpose == Purpose::Track {
+                // A new track is usually the one to play next.
+                self.live = self.session.project.tracks.len() - 1;
+                self.send(Command::LiveTrack(self.live));
+            }
+            self.chooser = None;
+            self.message = format!("added {name}");
+        }
+    }
+
+    fn open_project(&mut self, path: &Path) {
+        // SAFETY: the person picked this project to open.
+        match unsafe { Session::open(path, None) } {
+            Ok(session) => self.replace(session, Some(path.to_path_buf())),
+            Err(e) => self.message = format!("could not open {}: {e}", path.display()),
+        }
+    }
+
+    /// Puts another session in place of this one, with everything that
+    /// belongs to the old one let go first.
+    fn replace(&mut self, session: Session, save_to: Option<PathBuf>) {
+        while !self.editors.is_empty() {
+            self.close_editor(0);
+        }
+        self.stop_audio();
+        self.take = None;
+        self.chooser = None;
+        self.session = session;
+        self.save_to = save_to;
+        self.live = 0;
+        self.dirty = false;
+        self.retitle();
+        self.message = match &self.save_to {
+            Some(path) => format!("opened {}", path.display()),
+            None => "a new project".into(),
+        };
+        self.start_audio(0);
+    }
+
+    fn retitle(&mut self) {
+        let name = self
+            .save_to
+            .as_ref()
+            .map_or_else(|| "untitled".into(), |p| p.display().to_string());
+        self.title = format!("refrain — {name}");
+        if let Some(window) = &self.window {
+            window.window.set_title(&self.title);
+        }
+    }
+
+    fn save_as(&mut self) {
+        let Some(mut path) = rfd::FileDialog::new()
+            .add_filter("refrain project", &[refrain_project::EXTENSION])
+            .set_file_name("untitled.refrain")
+            .save_file()
+        else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension(refrain_project::EXTENSION);
+        }
+        self.save_to = Some(path);
+        self.save();
+        self.retitle();
     }
 
     /// Collects what came in from MIDI while recording; drops it otherwise.
@@ -335,7 +641,6 @@ impl Gui {
 
     fn save(&mut self) {
         let Some(file) = self.save_to.clone() else {
-            self.message = "start refrain gui with --save <project> to choose where to save".into();
             return;
         };
         self.message = match self.session.save(&file) {
@@ -573,5 +878,159 @@ mod tests {
         assert_eq!(events, [(0, on), (480, on)]);
         // The events land where they were played on the timeline.
         assert_eq!(start + events[1].0, tempo.ticks_at(1.25));
+    }
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use clack_host::prelude::PluginEntry;
+    use refrain_clap::ClapPlugin;
+
+    use super::*;
+    use crate::session::Chain;
+
+    // The CLAP test plugins, loaded in-process whatever the path says.
+    unsafe fn list(path: &Path) -> Result<Vec<Choice>> {
+        if path.ends_with("missing.clap") {
+            return Err("no such file".into());
+        }
+        let entry = PluginEntry::load_from_clack::<refrain_test_synth::Entry>(c"t").unwrap();
+        Ok(refrain_clap::plugins_in(&entry)?
+            .into_iter()
+            .map(|p| Choice {
+                effect: p.is_effect(),
+                id: p.id,
+                name: p.name,
+            })
+            .collect())
+    }
+
+    unsafe fn open(_path: &Path, id: Option<&str>) -> Result<Kind> {
+        let entry = PluginEntry::load_from_clack::<refrain_test_synth::Entry>(c"t").unwrap();
+        Ok(Kind::Clap(ClapPlugin::new(&entry, id)?))
+    }
+
+    /// A window's worth of state on a new project, with no audio output.
+    fn gui() -> Gui {
+        let mut gui = Gui::new(Session::empty(), None, None, String::new());
+        gui.list_file = list;
+        gui.open_plugin = open;
+        gui
+    }
+
+    fn pick(gui: &mut Gui, purpose: Purpose, name: &str) {
+        gui.act(Action::Choose(purpose));
+        gui.act(Action::PickPath(Some("plugins/synth.clap".into())));
+        let chooser = gui.model().chooser.expect("the chooser is open");
+        let i = chooser.plugins.iter().position(|p| p.name == name).unwrap();
+        gui.act(Action::PickPlugin(i));
+    }
+
+    #[test]
+    fn choosing_plugins_adds_tracks_and_effects() {
+        let mut gui = gui();
+        pick(&mut gui, Purpose::Track, "refrain test synth");
+        assert!(gui.chooser.is_none());
+        pick(&mut gui, Purpose::Track, "refrain test synth (notes only)");
+        pick(
+            &mut gui,
+            Purpose::Effect(Chain::Track(0)),
+            "refrain test effect",
+        );
+        pick(
+            &mut gui,
+            Purpose::Effect(Chain::Master),
+            "refrain test effect",
+        );
+        let model = gui.model();
+        let names: Vec<&str> = model.tracks.iter().map(|t| t.instrument.as_str()).collect();
+        assert_eq!(
+            names,
+            ["refrain test synth", "refrain test synth (notes only)"]
+        );
+        assert_eq!(model.tracks[0].effects, ["refrain test effect"]);
+        assert!(model.tracks[1].effects.is_empty());
+        assert_eq!(model.master_effects, ["refrain test effect"]);
+        // MIDI goes to the newest track; the project has changes to save.
+        assert_eq!((model.live, model.dirty), (1, true));
+    }
+
+    #[test]
+    fn the_chooser_lists_what_it_is_for_first_and_says_what_went_wrong() {
+        let mut gui = gui();
+        gui.act(Action::Choose(Purpose::Effect(Chain::Master)));
+        gui.act(Action::PickPath(Some("plugins/synth.clap".into())));
+        let chooser = gui.model().chooser.unwrap();
+        assert!(chooser.plugins[0].effect);
+        assert!(!chooser.plugins[1].effect);
+        gui.act(Action::PickPath(Some("plugins/missing.clap".into())));
+        assert!(
+            gui.model().status.contains("no such file"),
+            "{}",
+            gui.model().status
+        );
+        // Picking a file that failed leaves the chooser open.
+        assert!(gui.chooser.is_some());
+        gui.act(Action::CloseChooser);
+        assert!(gui.chooser.is_none());
+    }
+
+    #[test]
+    fn removing_a_track_keeps_midi_on_a_track_that_is_there() {
+        let mut gui = gui();
+        for _ in 0..3 {
+            pick(&mut gui, Purpose::Track, "refrain test synth");
+        }
+        assert_eq!(gui.live, 2);
+        gui.act(Action::RemoveTrack(2));
+        assert_eq!((gui.live, gui.model().tracks.len()), (1, 2));
+        pick(&mut gui, Purpose::Track, "refrain test synth");
+        gui.act(Action::LiveTrack(1));
+        gui.act(Action::RemoveTrack(0));
+        // The track MIDI went to moved up.
+        assert_eq!((gui.live, gui.model().tracks.len()), (0, 2));
+        gui.act(Action::RemoveTrack(5));
+        assert!(
+            gui.model().status.contains("no track 6"),
+            "{}",
+            gui.model().status
+        );
+    }
+
+    #[test]
+    fn effects_come_off_the_chain_they_are_on() {
+        let mut gui = gui();
+        pick(&mut gui, Purpose::Track, "refrain test synth");
+        pick(
+            &mut gui,
+            Purpose::Effect(Chain::Track(0)),
+            "refrain test effect",
+        );
+        pick(
+            &mut gui,
+            Purpose::Effect(Chain::Master),
+            "refrain test effect",
+        );
+        gui.act(Action::RemoveEffect(Chain::Track(0), 0));
+        let model = gui.model();
+        assert!(model.tracks[0].effects.is_empty());
+        assert_eq!(model.master_effects.len(), 1);
+    }
+
+    #[test]
+    fn unsaved_changes_are_thrown_away_only_on_a_second_press() {
+        let mut gui = gui();
+        pick(&mut gui, Purpose::Track, "refrain test synth");
+        gui.act(Action::New);
+        assert_eq!(gui.model().tracks.len(), 1);
+        assert!(gui.model().status.contains("press New again"));
+        // Something else in between asks again.
+        gui.act(Action::Click(false));
+        gui.act(Action::New);
+        assert_eq!(gui.model().tracks.len(), 1);
+        gui.act(Action::New);
+        let model = gui.model();
+        assert!(model.tracks.is_empty() && !model.dirty);
+        assert_eq!(model.title, "refrain — untitled");
     }
 }

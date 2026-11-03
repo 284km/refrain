@@ -311,6 +311,16 @@ from the plugins' buttons.
 - **Recording** starts playing at the playhead and collects what comes in
   from MIDI, stamped by the MIDI thread. Stopping turns it into a clip that
   starts where the recording began, on the track MIDI goes to.
+- **Adding and removing plugins** goes through the `Session`, which keeps the
+  project and the loaded plugins in step, around a rebuild of the mixer.
+  The chooser lists plugin files without loading them, from the folders
+  where plugins are installed and from the project; a file is loaded only
+  when picked, to list the plugins it holds. Removing closes the open
+  editors first, since the plugins after the removed one move up.
+- **The window's handling is tested too.** How plugins are listed and loaded
+  is swappable, so tests drive the window's state with the in-process test
+  plugins: choosing, adding, removing, and asking twice before unsaved
+  changes are thrown away.
 - **Fonts come from the system**, as the licensing policy explains. Without
   any of the fonts it looks for, the window does not open.
 
@@ -342,10 +352,11 @@ from the plugins' buttons.
   clip, means activating the plugins again, which refrain does while
   stopped. There are no sends, buses or groups, no automation, and effects
   get no MIDI and no side chain.
-- **refrain's window** cannot add or remove tracks and effects, open another
-  project, or edit clips yet; the project commands do the first two. Its
-  timeline always fits the whole song, without zooming or scrolling
-  sideways.
+- **refrain's window** cannot edit clips, reorder effects, or rename tracks
+  yet. Its timeline always fits the whole song, without zooming or scrolling
+  sideways. On macOS the system's file dialog may not let a `.clap` or
+  `.vst3` bundle be picked, as it is a folder; the chooser's list and its
+  path field can.
 - **Projects are saved when the editor closes or `play` ends**, with `--save`.
   There is no saving while playing, and no autosave.
 - **A project whose plugin has moved** is not found by ID in the installed

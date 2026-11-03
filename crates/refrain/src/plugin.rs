@@ -1,6 +1,6 @@
 //! Plugins of either format, chosen by file extension.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use refrain_clap::{ClapError, ClapPlugin};
 use refrain_engine::Processor;
@@ -203,6 +203,61 @@ impl Kind {
             Self::Vst3(_) => {}
         }
     }
+}
+
+/// A plugin a file holds, as a person chooses it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Choice {
+    /// What `Kind::open` takes: a CLAP plugin ID or a VST3 class ID.
+    pub id: String,
+    pub name: String,
+    pub effect: bool,
+}
+
+/// The plugins in a `.clap` or `.vst3` file.
+///
+/// # Safety
+///
+/// This runs the file's code in this process.
+pub unsafe fn list_file(path: &Path) -> Result<Vec<Choice>> {
+    let extension = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    Ok(match extension.as_str() {
+        "clap" => {
+            let entry = unsafe { refrain_clap::load_entry(path) }?;
+            refrain_clap::plugins_in(&entry)?
+                .into_iter()
+                .map(|p| Choice {
+                    effect: p.is_effect(),
+                    id: p.id,
+                    name: p.name,
+                })
+                .collect()
+        }
+        "vst3" => unsafe { Vst3Module::load(path) }?
+            .plugins()
+            .into_iter()
+            .map(|p| Choice {
+                effect: p.categories.split('|').any(|c| c == "Fx")
+                    && !p.categories.contains("Instrument"),
+                id: p.id,
+                name: p.name,
+            })
+            .collect(),
+        _ => return Err(format!("{} is not a .clap or .vst3 file", path.display()).into()),
+    })
+}
+
+/// The `.clap` and `.vst3` files in the folders where plugins are installed,
+/// without loading them.
+pub fn installed_files() -> Vec<PathBuf> {
+    let mut files = refrain_clap::find_clap_files(&refrain_clap::standard_paths());
+    files.extend(refrain_vst3::find_vst3_files(
+        &refrain_vst3::standard_paths(),
+    ));
+    files
 }
 
 /// Lists installed CLAP and VST3 plugins.

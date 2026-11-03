@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use refrain_engine::{Event, Mixer, Processor, Tempo, Track as MixerTrack};
-use refrain_project::{Plugin as Stored, Project, State};
+use refrain_project::{Plugin as Stored, Project, State, Track};
 
 use crate::Result;
 use crate::plugin::Kind;
@@ -14,6 +14,13 @@ pub enum Slot {
     Instrument(usize),
     Effect(usize, usize),
     Master(usize),
+}
+
+/// A chain of effects: a track's, or the master's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Chain {
+    Track(usize),
+    Master,
 }
 
 /// A project, and the plugins it names, loaded with their states.
@@ -96,6 +103,95 @@ impl Session {
         };
         println!("{}", session.summary());
         Ok(session)
+    }
+
+    /// A project with no tracks, not saved anywhere yet. Plugin paths start
+    /// from the current folder until it is.
+    pub fn empty() -> Self {
+        Self {
+            project: Project::default(),
+            file: PathBuf::from("untitled.refrain"),
+            tracks: Vec::new(),
+            master: Vec::new(),
+        }
+    }
+
+    /// Names `kind`, loaded from `file`, for this project.
+    fn stored(&self, file: &Path, kind: &Kind) -> Stored {
+        let (format, id, name) = kind.identity();
+        Stored::new(&self.file, format, file, id, name, State::default())
+    }
+
+    /// Adds a track playing `kind`, loaded from `file`, and returns its index.
+    pub fn add_track(&mut self, file: &Path, kind: Kind) -> usize {
+        let stored = self.stored(file, &kind);
+        self.project.tracks.push(Track::new(stored));
+        self.tracks.push(LoadedTrack {
+            instrument: kind,
+            effects: Vec::new(),
+        });
+        self.tracks.len() - 1
+    }
+
+    /// Removes track `index`, with its plugins. Their processors and editors
+    /// must be gone.
+    pub fn remove_track(&mut self, index: usize) -> Result<()> {
+        self.check_track(index)?;
+        self.project.tracks.remove(index);
+        self.tracks.remove(index);
+        Ok(())
+    }
+
+    fn chain_mut(&mut self, chain: Chain) -> Result<(&mut Vec<Stored>, &mut Vec<Kind>)> {
+        match chain {
+            Chain::Track(t) => {
+                self.check_track(t)?;
+                Ok((
+                    &mut self.project.tracks[t].effects,
+                    &mut self.tracks[t].effects,
+                ))
+            }
+            Chain::Master => Ok((&mut self.project.master.effects, &mut self.master)),
+        }
+    }
+
+    /// Adds `kind`, loaded from `file`, at the end of `chain`.
+    pub fn add_effect(&mut self, chain: Chain, file: &Path, kind: Kind) -> Result<()> {
+        let stored = self.stored(file, &kind);
+        let (project, loaded) = self.chain_mut(chain)?;
+        project.push(stored);
+        loaded.push(kind);
+        Ok(())
+    }
+
+    /// Removes effect `index` of `chain`. Its processor and editor must be
+    /// gone.
+    pub fn remove_effect(&mut self, chain: Chain, index: usize) -> Result<()> {
+        let (project, loaded) = self.chain_mut(chain)?;
+        if index >= loaded.len() {
+            return Err(format!("there is no effect {} there", index + 1).into());
+        }
+        project.remove(index);
+        loaded.remove(index);
+        Ok(())
+    }
+
+    /// The plugin files the project uses, each once, as found from here.
+    pub fn plugin_files(&self) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = Vec::new();
+        let project = &self.project;
+        let stored = project
+            .tracks
+            .iter()
+            .flat_map(|t| std::iter::once(&t.instrument).chain(&t.effects))
+            .chain(&project.master.effects);
+        for s in stored {
+            let file = s.file(&self.file);
+            if !files.contains(&file) {
+                files.push(file);
+            }
+        }
+        files
     }
 
     /// One line about the project.
@@ -252,5 +348,149 @@ impl Session {
         self.project.write(file)?;
         self.file = file.to_path_buf();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clack_host::prelude::PluginEntry;
+    use refrain_clap::ClapPlugin;
+    use refrain_engine::{TimedEvent, render_offline};
+    use refrain_test_tone::effect;
+    use refrain_vst3::{Vst3Module, Vst3Plugin};
+
+    use super::*;
+
+    fn clap(id: &str) -> Kind {
+        let entry =
+            PluginEntry::load_from_clack::<refrain_test_synth::Entry>(c"refrain-test-synth")
+                .unwrap();
+        Kind::Clap(ClapPlugin::new(&entry, Some(id)).unwrap())
+    }
+
+    fn vst3(name: &str) -> Kind {
+        let module =
+            unsafe { Vst3Module::from_factory(refrain_test_synth_vst3::GetPluginFactory()) }
+                .unwrap();
+        Kind::Vst3(Vst3Plugin::new(&module, Some(name)).unwrap())
+    }
+
+    fn chord() -> Vec<TimedEvent> {
+        [60, 64, 67]
+            .into_iter()
+            .map(|key| TimedEvent {
+                frame: 100,
+                event: Event::NoteOn {
+                    channel: 0,
+                    key,
+                    velocity: 1.0,
+                },
+            })
+            .collect()
+    }
+
+    /// The first channel of what the session plays from `events` on track 0.
+    fn play(session: &mut Session) -> Vec<f32> {
+        let mut mixer = session.mixer(48_000.0, 128, 0, &[]).unwrap();
+        let out = render_offline(&mut mixer, 48_000.0, 1, 4_800, 128, &chord());
+        assert!(!mixer.has_failed());
+        out
+    }
+
+    #[test]
+    fn tracks_and_effects_come_and_go_in_step_with_the_project() {
+        let mut session = Session::empty();
+        assert_eq!(
+            session.add_track(Path::new("synth.clap"), clap(refrain_test_synth::ID)),
+            0
+        );
+        let dry = play(&mut session);
+
+        session
+            .add_effect(
+                Chain::Track(0),
+                Path::new("synth.vst3"),
+                vst3(refrain_test_synth_vst3::EFFECT_NAME),
+            )
+            .unwrap();
+        session
+            .add_effect(
+                Chain::Master,
+                Path::new("synth.clap"),
+                clap(refrain_test_synth::EFFECT_ID),
+            )
+            .unwrap();
+        // The track's effect, then the master's: doubled and clipped twice.
+        let mut expected = dry.clone();
+        effect::process(effect::DEFAULT_GAIN, &mut expected);
+        effect::process(effect::DEFAULT_GAIN, &mut expected);
+        assert_eq!(play(&mut session), expected);
+
+        let p = &session.project;
+        assert_eq!(
+            p.tracks[0].effects[0].name,
+            refrain_test_synth_vst3::EFFECT_NAME
+        );
+        assert_eq!(p.master.effects[0].id, refrain_test_synth::EFFECT_ID);
+        assert_eq!(
+            session.plugin_files(),
+            [PathBuf::from("synth.clap"), PathBuf::from("synth.vst3")]
+        );
+
+        // A second track, which MIDI does not reach, adds nothing.
+        session.add_track(Path::new("synth.vst3"), vst3(refrain_test_synth_vst3::NAME));
+        assert_eq!(play(&mut session), expected);
+
+        session.remove_effect(Chain::Track(0), 0).unwrap();
+        session.remove_effect(Chain::Master, 0).unwrap();
+        assert_eq!(play(&mut session), dry);
+        session.remove_track(0).unwrap();
+        assert_eq!(session.project.tracks.len(), 1);
+        assert_eq!(
+            session.project.tracks[0].instrument.name,
+            refrain_test_synth_vst3::NAME
+        );
+
+        assert!(session.remove_track(1).is_err());
+        assert!(session.remove_effect(Chain::Track(0), 0).is_err());
+        assert!(session.remove_effect(Chain::Master, 0).is_err());
+    }
+
+    #[test]
+    fn a_saved_session_keeps_each_plugins_state_in_its_place() {
+        let mut session = Session::empty();
+        session.add_track(Path::new("synth.clap"), clap(refrain_test_synth::ID));
+        let mut half = clap(refrain_test_synth::EFFECT_ID);
+        half.load_state(&State {
+            data: effect::save_state(0.5).to_vec(),
+            controller: Vec::new(),
+        })
+        .unwrap();
+        session
+            .add_effect(Chain::Track(0), Path::new("synth.clap"), half)
+            .unwrap();
+        session
+            .add_effect(
+                Chain::Master,
+                Path::new("synth.clap"),
+                clap(refrain_test_synth::EFFECT_ID),
+            )
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("refrain-session-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("song.refrain");
+        session.save(&file).unwrap();
+        let saved = Project::read(&file).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let state = |p: &Stored| p.state.data.clone();
+        assert_eq!(
+            state(&saved.tracks[0].instrument),
+            refrain_test_tone::save_state(1.0)
+        );
+        assert_eq!(state(&saved.tracks[0].effects[0]), effect::save_state(0.5));
+        assert_eq!(
+            state(&saved.master.effects[0]),
+            effect::save_state(effect::DEFAULT_GAIN)
+        );
     }
 }

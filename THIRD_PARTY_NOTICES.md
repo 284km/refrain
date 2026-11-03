@@ -22,6 +22,7 @@ refrain is MIT-licensed and depends only on permissively licensed crates.
 | [egui-wgpu](https://github.com/emilk/egui) | MIT OR Apache-2.0 | Painting egui through wgpu |
 | [wgpu](https://github.com/gfx-rs/wgpu) | MIT OR Apache-2.0 | The GPU, through Metal on macOS and Direct3D 12 on Windows |
 | [pollster](https://github.com/zesterer/pollster) | MIT OR Apache-2.0 | Waiting for wgpu's set-up |
+| [rfd](https://github.com/PolyMeilex/rfd) | MIT | The system's dialogs for opening and saving projects and picking plugin files |
 | [egui_kittest](https://github.com/emilk/egui) | MIT OR Apache-2.0 | Tests only: clicking through the window without a screen |
 | [raw-window-handle](https://github.com/rust-windowing/raw-window-handle) | MIT OR Apache-2.0 OR Zlib | Passing that window to plugins |
 | [serde](https://github.com/serde-rs/serde) | MIT OR Apache-2.0 | Project files |

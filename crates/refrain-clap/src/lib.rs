@@ -46,6 +46,16 @@ pub struct PluginInfo {
     pub name: String,
     pub vendor: String,
     pub version: String,
+    /// What the plugin says it is, such as `instrument` or `audio-effect`.
+    pub features: Vec<String>,
+}
+
+impl PluginInfo {
+    /// Whether the plugin says it is an effect and not an instrument.
+    pub fn is_effect(&self) -> bool {
+        let has = |f: &str| self.features.iter().any(|x| x == f);
+        has("audio-effect") && !has("instrument")
+    }
 }
 
 impl fmt::Display for PluginInfo {
@@ -197,6 +207,10 @@ pub fn plugins_in(entry: &PluginEntry) -> Result<Vec<PluginInfo>, ClapError> {
                 name: text(d.name()),
                 vendor: text(d.vendor()),
                 version: text(d.version()),
+                features: d
+                    .features()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .collect(),
             })
         })
         .collect())

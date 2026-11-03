@@ -142,6 +142,9 @@ jobs:
         run: |
           cargo run -- gui tests/projects/mix-clap.refrain --play --seconds 2 | tee target/gui.log
           grep -q "window: first frame drawn" target/gui.log
+          # And on a new project.
+          cargo run -- gui --seconds 1 | tee target/gui.log
+          grep -q "window: first frame drawn" target/gui.log
       # Open each test plugin's editor in a real window, and check it ended up
       # inside that window.
       - name: Open the test plugins' editors

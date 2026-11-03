@@ -137,8 +137,16 @@ cargo run -- gui band.refrain
 cargo run -- gui target/test-plugins/refrain-test-synth.clap --save new.refrain
 ```
 
-Adding and removing tracks and effects is still done with the project
-commands above.
+**Add track** and **+ effect** open a chooser listing the plugin files where
+plugins are installed and those the project already uses; a file can also be
+typed in or picked in the system's dialog. When a file holds several plugins,
+pick one. Right-click a track's name or an effect to remove it. **New**,
+**Open…** and **Save as…** do what they say; with unsaved changes, New and
+Open ask to be pressed twice.
+
+```sh
+cargo run -- gui                                    # a new project
+```
 
 ## Documentation
 
