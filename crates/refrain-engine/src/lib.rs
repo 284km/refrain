@@ -21,7 +21,7 @@ mod timeline;
 pub use event::{
     ALL_NOTES_OFF, Event, MAX_PEDAL_RELEASES, PITCH_BEND_CENTRE, SUSTAIN, SustainPedal, TimedEvent,
 };
-pub use mixer::{MAX_CHANNELS, Mix, Mixer, Track, gain_from_db};
+pub use mixer::{MAX_CHANNELS, Mix, Mixer, Sequence, Track, gain_from_db};
 pub use timeline::{Recording, Sequencer, TICKS_PER_BEAT, Tempo};
 
 /// Something that fills audio buffers: an instrument, an effect, or a chain

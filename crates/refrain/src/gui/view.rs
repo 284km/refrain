@@ -7,9 +7,10 @@
 use egui::{
     Align, Align2, Color32, FontId, Layout, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, vec2,
 };
-use refrain_engine::{Event, Tempo};
-use refrain_project::{Mix, Track};
+use refrain_engine::{Event, TICKS_PER_BEAT, Tempo};
+use refrain_project::{Mix, Note, Track};
 
+use super::piano::{self, PianoView};
 use crate::plugin::Choice;
 use crate::session::{Chain, Slot};
 
@@ -36,6 +37,12 @@ pub struct Model {
     pub status: String,
     /// Choosing a plugin to add, when that is going on.
     pub chooser: Option<ChooserView>,
+    /// The clip picked in the timeline: its track and its index there.
+    pub selected: Option<(usize, usize)>,
+    /// The clip whose notes are being edited.
+    pub piano: Option<PianoView>,
+    pub can_undo: bool,
+    pub can_redo: bool,
 }
 
 /// What a plugin being chosen is for.
@@ -85,6 +92,8 @@ pub struct ClipView {
     pub start: f64,
     pub end: f64,
     pub notes: Vec<NoteView>,
+    /// Where it starts, in ticks of the timeline.
+    pub start_tick: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -128,6 +137,19 @@ pub enum Action {
     CloseChooser,
     RemoveTrack(usize),
     RemoveEffect(Chain, usize),
+    /// Pick a clip by track and index, or none.
+    SelectClip(Option<(usize, usize)>),
+    /// Move a clip to start at a tick.
+    MoveClip(usize, usize, u64),
+    DuplicateClip(usize, usize),
+    DeleteClip(usize, usize),
+    /// Edit a clip's notes in the piano roll.
+    OpenPiano(usize, usize),
+    ClosePiano,
+    /// A clip's notes, all of them, after an edit.
+    SetNotes(usize, usize, Vec<Note>),
+    Undo,
+    Redo,
 }
 
 impl TrackView {
@@ -183,6 +205,7 @@ pub fn clips_of(track: &Track, tempo: Tempo) -> Vec<ClipView> {
                 start: at(0),
                 end,
                 notes,
+                start_tick: clip.start,
             }
         })
         .collect()
@@ -227,12 +250,40 @@ impl Model {
 /// Draws the window and returns what the person did.
 pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
     let mut actions = Vec::new();
+    shortcuts(ui, model, &mut actions);
     egui::Panel::top("transport").show(ui, |ui| transport(ui, model, &mut actions));
     egui::Panel::bottom("master").show(ui, |ui| master(ui, model, &mut actions));
     egui::CentralPanel::default_margins().show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| timeline(ui, model, &mut actions));
     });
     actions
+}
+
+/// Keys that act on the selected clip, and undo and redo, unless something
+/// such as a text field takes the keyboard.
+fn shortcuts(ui: &mut Ui, model: &Model, actions: &mut Vec<Action>) {
+    use egui::{Key, Modifiers};
+    if ui.ctx().egui_wants_keyboard_input() {
+        return;
+    }
+    ui.input_mut(|i| {
+        if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) {
+            actions.push(Action::Redo);
+        }
+        if i.consume_key(Modifiers::COMMAND, Key::Z) {
+            actions.push(Action::Undo);
+        }
+        if let Some((t, c)) = model.selected {
+            if i.consume_key(Modifiers::NONE, Key::Delete)
+                || i.consume_key(Modifiers::NONE, Key::Backspace)
+            {
+                actions.push(Action::DeleteClip(t, c));
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::D) {
+                actions.push(Action::DuplicateClip(t, c));
+            }
+        }
+    });
 }
 
 fn transport(ui: &mut Ui, model: &Model, actions: &mut Vec<Action>) {
@@ -294,6 +345,19 @@ fn transport(ui: &mut Ui, model: &Model, actions: &mut Vec<Action>) {
         }
         ui.separator();
         if ui
+            .add_enabled(model.can_undo, egui::Button::new("Undo"))
+            .clicked()
+        {
+            actions.push(Action::Undo);
+        }
+        if ui
+            .add_enabled(model.can_redo, egui::Button::new("Redo"))
+            .clicked()
+        {
+            actions.push(Action::Redo);
+        }
+        ui.separator();
+        if ui
             .add_enabled(stopped, egui::Button::new("Add track"))
             .clicked()
         {
@@ -320,6 +384,9 @@ fn master(ui: &mut Ui, model: &Model, actions: &mut Vec<Action>) {
     });
     if let Some(chooser) = &model.chooser {
         chooser_window(ui, chooser, actions);
+    }
+    if let Some(piano) = &model.piano {
+        piano::window(ui, piano, actions);
     }
 }
 
@@ -478,7 +545,7 @@ fn timeline(ui: &mut Ui, model: &Model, actions: &mut Vec<Action>) {
             |ui| header(ui, model, t, track, actions),
         );
         let response = ui.interact(rect, ui.scope_id().with(("lane", t)), Sense::click());
-        lane(ui, model, track, rect, length);
+        lane(ui, model, t, track, rect, length, actions);
         locate_on_click(&response, rect, length, actions);
         ui.separator();
     }
@@ -578,9 +645,41 @@ fn ruler(ui: &Ui, model: &Model, rect: Rect, length: f64) {
     playhead(ui, model, rect, length);
 }
 
-fn lane(ui: &Ui, model: &Model, track: &TrackView, rect: Rect, length: f64) {
+/// How far `response`'s widget has been dragged: while it is, and on the
+/// frame it is let go, when egui no longer says.
+pub(super) fn drag_offset(ui: &Ui, response: &egui::Response) -> egui::Vec2 {
+    let id = response.id.with("drag offset");
+    if let Some(delta) = response.total_drag_delta() {
+        ui.memory_mut(|m| m.data.insert_temp(id, delta));
+        return delta;
+    }
+    if response.drag_stopped() {
+        return ui
+            .memory_mut(|m| m.data.remove_temp::<egui::Vec2>(id))
+            .unwrap_or_default();
+    }
+    egui::Vec2::ZERO
+}
+
+/// The ticks a horizontal drag of `dx` stands for in a lane `width` wide
+/// showing `length` seconds, to the nearest beat.
+fn beats_dragged(dx: f32, width: f32, length: f64, tempo: f64) -> i64 {
+    let seconds = f64::from(dx / width) * length;
+    (seconds * tempo / 60.0).round() as i64 * TICKS_PER_BEAT as i64
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lane(
+    ui: &mut Ui,
+    model: &Model,
+    t: usize,
+    track: &TrackView,
+    rect: Rect,
+    length: f64,
+    actions: &mut Vec<Action>,
+) {
     let painter = ui.painter_at(rect);
-    let visuals = ui.visuals();
+    let visuals = ui.visuals().clone();
     painter.rect_filled(rect, 0.0, visuals.extreme_bg_color);
     let bar = model.seconds_per_bar();
     let mut n = 0;
@@ -600,24 +699,66 @@ fn lane(ui: &Ui, model: &Model, track: &TrackView, rect: Rect, length: f64) {
     } else {
         Color32::from_rgb(70, 140, 200)
     };
-    for clip in &track.clips {
+    let seconds_per_tick = 60.0 / model.tempo / TICKS_PER_BEAT as f64;
+    for (c, clip) in track.clips.iter().enumerate() {
         let clip_rect = Rect::from_x_y_ranges(
             x_at(rect, length, clip.start)
-                ..=x_at(rect, length, clip.end).max(x_at(rect, length, clip.start) + 4.0),
+                ..=x_at(rect, length, clip.end).max(x_at(rect, length, clip.start) + 6.0),
             rect.top() + 4.0..=rect.bottom() - 4.0,
         );
-        painter.rect_filled(clip_rect, 3.0, colour.gamma_multiply(0.35));
-        painter.rect_stroke(
+        let response = ui.interact(
             clip_rect,
-            3.0,
-            Stroke::new(1.0, colour),
-            egui::StrokeKind::Inside,
+            ui.scope_id().with(("clip", t, c)),
+            Sense::click_and_drag(),
         );
-        let inner = clip_rect.shrink(4.0);
+        let label = format!("clip {} on track {}", c + 1, t + 1);
+        response
+            .widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, true, &label));
+        // While dragged, the clip is drawn where it would land.
+        let mut shift = 0.0;
+        if response.dragged() || response.drag_stopped() {
+            let dx = drag_offset(ui, &response).x;
+            let ticks = beats_dragged(dx, rect.width(), length, model.tempo);
+            let start = (clip.start_tick as i64 + ticks).max(0) as u64;
+            shift = (start as f64 - clip.start_tick as f64) * seconds_per_tick;
+            if response.drag_stopped() && start != clip.start_tick {
+                actions.push(Action::MoveClip(t, c, start));
+            }
+        }
+        if response.clicked() {
+            actions.push(Action::SelectClip(Some((t, c))));
+        }
+        if response.double_clicked() {
+            actions.push(Action::OpenPiano(t, c));
+        }
+        response.context_menu(|ui| {
+            if ui.button("Edit notes").clicked() {
+                actions.push(Action::OpenPiano(t, c));
+            }
+            if ui.button("Duplicate").clicked() {
+                actions.push(Action::DuplicateClip(t, c));
+            }
+            if ui.button("Delete clip").clicked() {
+                actions.push(Action::DeleteClip(t, c));
+            }
+        });
+        let at = |seconds: f64| x_at(rect, length, seconds + shift);
+        let shown = Rect::from_x_y_ranges(
+            at(clip.start)..=at(clip.end).max(at(clip.start) + 6.0),
+            clip_rect.y_range(),
+        );
+        let stroke = if model.selected == Some((t, c)) {
+            Stroke::new(2.0, visuals.strong_text_color())
+        } else {
+            Stroke::new(1.0, colour)
+        };
+        painter.rect_filled(shown, 3.0, colour.gamma_multiply(0.35));
+        painter.rect_stroke(shown, 3.0, stroke, egui::StrokeKind::Inside);
+        let inner = shown.shrink(4.0);
         for note in &clip.notes {
             let y = inner.bottom() - f32::from(note.key - low) / span * inner.height();
-            let x0 = x_at(rect, length, note.start);
-            let x1 = x_at(rect, length, note.end).max(x0 + 2.0);
+            let x0 = at(note.start);
+            let x1 = at(note.end).max(x0 + 2.0);
             painter.line_segment(
                 [Pos2::new(x0, y), Pos2::new(x1, y)],
                 Stroke::new(3.0, colour),
@@ -678,6 +819,10 @@ mod tests {
             dirty: false,
             status: String::new(),
             chooser: None,
+            selected: None,
+            piano: None,
+            can_undo: false,
+            can_redo: false,
         }
     }
 
@@ -948,15 +1093,191 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clips_are_picked_and_their_menus_act_on_them() {
+        assert_eq!(
+            after_click(model(), "clip 1 on track 2"),
+            [Action::SelectClip(Some((1, 0)))]
+        );
+        for (item, action) in [
+            ("Duplicate", Action::DuplicateClip(1, 0)),
+            ("Delete clip", Action::DeleteClip(1, 0)),
+            ("Edit notes", Action::OpenPiano(1, 0)),
+        ] {
+            let mut harness = harness(model());
+            harness.get_by_label("clip 1 on track 2").click_secondary();
+            harness.run();
+            harness.get_by_label(item).click();
+            harness.run();
+            assert_eq!(harness.state().1, [action], "{item}");
+        }
+    }
+
+    /// Drags the widget labelled `label` by `by`, and returns what was asked.
+    fn drag(model: Model, label: &str, by: egui::Vec2) -> Vec<Action> {
+        let mut harness = harness(model);
+        let from = harness.get_by_label(label).rect().center();
+        harness.drag_at(from);
+        harness.run();
+        for step in 1..=4 {
+            harness.hover_at(from + by * (step as f32 / 4.0));
+            harness.run();
+        }
+        harness.drop_at(from + by);
+        harness.run();
+        std::mem::take(&mut harness.state_mut().1)
+    }
+
+    #[test]
+    fn a_dragged_clip_moves_by_whole_beats() {
+        let actions = drag(model(), "clip 1 on track 1", vec2(150.0, 0.0));
+        let moved: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, Action::MoveClip(..)))
+            .collect();
+        match moved.as_slice() {
+            [Action::MoveClip(0, 0, start)] => {
+                assert!(*start > 0 && start % TICKS_PER_BEAT == 0, "{start}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Dragged left of the start, it stays where it is.
+        let actions = drag(model(), "clip 1 on track 1", vec2(-150.0, 0.0));
+        assert!(!actions.iter().any(|a| matches!(a, Action::MoveClip(..))));
+        assert_eq!(
+            beats_dragged(100.0, 800.0, 16.0, 120.0),
+            4 * TICKS_PER_BEAT as i64
+        );
+    }
+
+    #[test]
+    fn keys_act_on_the_picked_clip_and_undo() {
+        use egui::{Key, Modifiers};
+        let picked = Model {
+            selected: Some((0, 0)),
+            can_undo: true,
+            can_redo: true,
+            ..model()
+        };
+        let pressed = |modifiers: Modifiers, key: Key| {
+            let mut harness = harness(picked.clone());
+            harness.key_press_modifiers(modifiers, key);
+            harness.run();
+            std::mem::take(&mut harness.state_mut().1)
+        };
+        assert_eq!(
+            pressed(Modifiers::NONE, Key::Delete),
+            [Action::DeleteClip(0, 0)]
+        );
+        assert_eq!(
+            pressed(Modifiers::NONE, Key::Backspace),
+            [Action::DeleteClip(0, 0)]
+        );
+        assert_eq!(
+            pressed(Modifiers::COMMAND, Key::D),
+            [Action::DuplicateClip(0, 0)]
+        );
+        assert_eq!(pressed(Modifiers::COMMAND, Key::Z), [Action::Undo]);
+        assert_eq!(
+            pressed(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z),
+            [Action::Redo]
+        );
+        assert_eq!(after_click(picked.clone(), "Undo"), [Action::Undo]);
+        // Nothing to undo: the buttons do nothing.
+        assert!(after_click(model(), "Undo").is_empty());
+        assert!(after_click(model(), "Redo").is_empty());
+    }
+
+    /// The notes of the mix project's first clip.
+    fn model_notes() -> Vec<Note> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/projects/mix-clap.refrain"
+        );
+        let project = Project::read(std::path::Path::new(path)).unwrap();
+        project.tracks[0].clips[0].notes().0
+    }
+
+    fn with_piano(notes: Vec<Note>) -> Model {
+        Model {
+            piano: Some(PianoView {
+                track: 0,
+                clip: 0,
+                notes,
+                length: 4 * 4 * TICKS_PER_BEAT,
+            }),
+            ..model()
+        }
+    }
+
+    fn c4() -> Note {
+        Note {
+            start: 0,
+            length: TICKS_PER_BEAT,
+            channel: 0,
+            key: 60,
+            velocity: 100,
+            release: 64,
+        }
+    }
+
+    #[test]
+    fn the_piano_roll_adds_removes_moves_and_resizes_notes() {
+        let mut harness = harness(with_piano(vec![c4()]));
+        harness.get_by_label("note 60 at tick 0").click_secondary();
+        harness.run();
+        assert_eq!(harness.state().1, [Action::SetNotes(0, 0, Vec::new())]);
+
+        let added = after_click(with_piano(vec![c4()]), "notes");
+        match added.as_slice() {
+            [Action::SetNotes(0, 0, notes)] => {
+                assert_eq!(notes.len(), 2);
+                assert!(notes.contains(&c4()));
+                let new = notes.iter().find(|n| **n != c4()).unwrap();
+                assert_eq!(new.length, piano::NEW_LENGTH);
+                assert_eq!(new.start % piano::SNAP, 0);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A beat is 80 points wide and a key 10 high.
+        let moved = drag(
+            with_piano(vec![c4()]),
+            "note 60 at tick 0",
+            vec2(160.0, -20.0),
+        );
+        let expected = Note {
+            start: 2 * TICKS_PER_BEAT,
+            key: 62,
+            ..c4()
+        };
+        assert_eq!(moved.last(), Some(&Action::SetNotes(0, 0, vec![expected])));
+        let longer = drag(
+            with_piano(vec![c4()]),
+            "end of note 60 at tick 0",
+            vec2(80.0, 0.0),
+        );
+        let expected = Note {
+            length: 2 * TICKS_PER_BEAT,
+            ..c4()
+        };
+        assert_eq!(longer.last(), Some(&Action::SetNotes(0, 0, vec![expected])));
+    }
+
     /// Writes what the window looks like to target/gui-preview.png, for a
     /// person to look at: `cargo test -p refrain preview -- --ignored`.
     #[test]
     #[ignore = "writes a picture; run by hand"]
     fn preview() {
         let target = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target");
+        let piano = Model {
+            selected: Some((0, 0)),
+            ..with_piano(model_notes())
+        };
         for (model, name) in [
             (model(), "gui-preview.png"),
             (choosing(), "gui-chooser.png"),
+            (piano, "gui-piano.png"),
         ] {
             let mut harness = harness_with(model, true);
             let image = harness.render().unwrap();

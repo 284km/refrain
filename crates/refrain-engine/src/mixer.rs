@@ -53,6 +53,9 @@ pub fn gain_from_db(db: f32) -> f32 {
     10f32.powf(db / 20.0)
 }
 
+/// Events at frames from the start of the timeline, in order of frame.
+pub type Sequence = Vec<(u64, Event)>;
+
 /// An instrument followed by its effects, how it goes into the mix, and the
 /// sequence played on the instrument.
 pub struct Track {
@@ -64,6 +67,8 @@ pub struct Track {
     sequence: Vec<(u64, Event)>,
     next: usize,
     block: Vec<TimedEvent>,
+    // Send the instrument the release events in the next block.
+    releasing: bool,
 }
 
 impl Track {
@@ -76,6 +81,7 @@ impl Track {
             sequence: Vec::new(),
             next: 0,
             block: Vec::with_capacity(MAX_BLOCK_EVENTS),
+            releasing: false,
         }
     }
 
@@ -213,6 +219,24 @@ impl Mixer {
         self.playhead
     }
 
+    /// Plays `sequence` on track `index` from now on, from where the playhead
+    /// is, and releases that track's notes, since the note offs of the old
+    /// sequence may be gone. `sequence` must be in order of frame.
+    ///
+    /// Returns the old sequence, so that it is freed somewhere other than
+    /// the audio thread; `None` when there is no such track, giving the new
+    /// one back.
+    pub fn set_sequence(&mut self, index: usize, sequence: Sequence) -> Result<Sequence, Sequence> {
+        let Some(track) = self.tracks.get_mut(index) else {
+            return Err(sequence);
+        };
+        debug_assert!(sequence.is_sorted_by_key(|e| e.0));
+        let old = std::mem::replace(&mut track.sequence, sequence);
+        track.next = track.sequence.partition_point(|(f, _)| *f < self.playhead);
+        track.releasing = true;
+        Ok(old)
+    }
+
     /// Turns the metronome on or off, if there is one.
     pub fn set_click(&mut self, on: bool) {
         self.click_on = on;
@@ -247,6 +271,7 @@ impl Processor for Mixer {
         self.releasing = false;
         for track in &mut self.tracks {
             track.next = 0;
+            track.releasing = false;
             track.buffer = vec![0.0; max_block_frames * MAX_CHANNELS];
             for p in &mut track.chain {
                 p.prepare(sample_rate, max_block_frames);
@@ -270,8 +295,9 @@ impl Processor for Mixer {
             buffer.fill(0.0);
             let live = if self.live == Some(i) { events } else { &[] };
             track.block.clear();
-            if self.releasing {
+            if self.releasing || track.releasing {
                 release(&mut track.block);
+                track.releasing = false;
             }
             if self.playing {
                 merge(
@@ -643,6 +669,31 @@ mod tests {
             RELEASE_EVENTS
         );
         assert_eq!(mixer.playhead(), 1_100);
+    }
+
+    #[test]
+    fn a_new_sequence_plays_from_the_playhead_and_releases_the_old_notes() {
+        let (a, log_a) = logged(vec![(10, note(60)), (500, note(61))]);
+        let (b, log_b) = logged(Vec::new());
+        let mut mixer = Mixer::new(vec![a, b], Vec::new(), 0.0);
+        mixer.prepare(RATE, 128);
+        run(&mut mixer, 100, 2);
+        let old = mixer
+            .set_sequence(0, vec![(150, note(70)), (250, note(71)), (600, note(72))])
+            .unwrap();
+        assert_eq!(old, [(10, note(60)), (500, note(61))]);
+        run(&mut mixer, 100, 5);
+        let log = log_a.lock().unwrap();
+        let notes: Vec<_> = log.iter().filter(|(_, e)| !is_release(e)).collect();
+        // What was behind the playhead at 200 is not played.
+        assert_eq!(notes, [&(10, note(60)), &(250, note(71)), &(600, note(72))]);
+        assert_eq!(
+            log.iter().filter(|(_, e)| is_release(e)).count(),
+            RELEASE_EVENTS
+        );
+        // The other track is left alone.
+        assert!(log_b.lock().unwrap().is_empty());
+        assert!(mixer.set_sequence(5, Vec::new()).is_err());
     }
 
     #[test]

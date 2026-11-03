@@ -148,6 +148,13 @@ Open ask to be pressed twice.
 cargo run -- gui                                    # a new project
 ```
 
+Clips can be edited in the timeline, while playing too: click one to pick it,
+drag it to move it by whole beats, and right-click it to duplicate or delete
+it (or press ⌘D or Delete; Ctrl on Windows). Double-click a clip to edit its
+notes in the piano roll: click to add a note, drag it to move it, drag its end
+to change its length, right-click it to remove it. Undo and Redo (⌘Z and ⇧⌘Z)
+take back clip and note edits.
+
 ## Documentation
 
 - [Architecture](docs/en/architecture.md)

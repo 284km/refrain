@@ -191,6 +191,136 @@ impl Track {
         events.sort_by_key(|e| e.0);
         self.clips.push(Clip { start, events });
     }
+
+    /// Moves clip `index` to start at tick `start`.
+    pub fn move_clip(&mut self, index: usize, start: u64) {
+        if let Some(clip) = self.clips.get_mut(index) {
+            clip.start = start;
+        }
+    }
+
+    /// Adds a copy of clip `index` after it, at the first bar of
+    /// `ticks_per_bar` ticks from its end, and returns the copy's index.
+    pub fn duplicate_clip(&mut self, index: usize, ticks_per_bar: u64) -> Option<usize> {
+        let clip = self.clips.get(index)?;
+        let bar = ticks_per_bar.max(1);
+        let end = clip.start + clip.length().max(1);
+        let mut copy = clip.clone();
+        copy.start = end.div_ceil(bar) * bar;
+        self.clips.push(copy);
+        Some(self.clips.len() - 1)
+    }
+
+    pub fn remove_clip(&mut self, index: usize) -> Option<Clip> {
+        (index < self.clips.len()).then(|| self.clips.remove(index))
+    }
+}
+
+/// A note of a clip, as a piano roll shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Note {
+    /// Ticks from the clip's start.
+    pub start: u64,
+    /// In ticks, at least 1.
+    pub length: u64,
+    pub channel: u8,
+    pub key: u8,
+    /// The note on's velocity, from 1 to 127.
+    pub velocity: u8,
+    /// The note off's velocity.
+    pub release: u8,
+}
+
+impl Clip {
+    /// The tick, from the clip's start, of its last event.
+    pub fn length(&self) -> u64 {
+        self.events.last().map_or(0, |e| e.0)
+    }
+
+    /// The clip's notes, and its other events: controllers, pitch bend and
+    /// any note off that has no note on before it.
+    ///
+    /// A note on goes with the next note off of its key on its channel. A
+    /// note on with velocity 0 counts as a note off, as in MIDI. A note left
+    /// on ends with the clip. [`with_notes`](Self::with_notes) puts them
+    /// back together.
+    pub fn notes(&self) -> (Vec<Note>, Vec<(u64, Vec<u8>)>) {
+        let end = self.length();
+        let mut notes = Vec::new();
+        let mut open: Vec<Note> = Vec::new();
+        let mut others = Vec::new();
+        for (tick, midi) in &self.events {
+            let (kind, channel) = (midi.first().map_or(0, |s| s & 0xf0), midi[0] & 0x0f);
+            match (kind, midi.as_slice()) {
+                (0x90, &[_, key, velocity]) if velocity > 0 => open.push(Note {
+                    start: *tick,
+                    length: 0,
+                    channel,
+                    key,
+                    velocity,
+                    release: 64,
+                }),
+                (0x80 | 0x90, &[status, key, velocity]) => {
+                    match open
+                        .iter()
+                        .position(|n| (n.channel, n.key) == (channel, key))
+                    {
+                        Some(i) => {
+                            let mut note = open.remove(i);
+                            note.length = (tick - note.start).max(1);
+                            if status & 0xf0 == 0x80 {
+                                note.release = velocity;
+                            }
+                            notes.push(note);
+                        }
+                        None => others.push((*tick, midi.clone())),
+                    }
+                }
+                _ => others.push((*tick, midi.clone())),
+            }
+        }
+        notes.extend(open.into_iter().map(|mut n| {
+            n.length = end.saturating_sub(n.start).max(1);
+            n
+        }));
+        notes.sort_by_key(|n| (n.start, n.key));
+        (notes, others)
+    }
+
+    /// This clip with `notes` in place of its notes, and `others` for its
+    /// other events. At a tick, note offs come first, then other events,
+    /// then note ons, so a key struck again where it was let go sounds.
+    /// Other events keep their order.
+    pub fn with_notes(&self, notes: &[Note], others: &[(u64, Vec<u8>)]) -> Clip {
+        let mut events: Vec<(u64, u8, Vec<u8>)> = others
+            .iter()
+            .map(|(tick, midi)| (*tick, 1, midi.clone()))
+            .collect();
+        for n in notes {
+            let channel = n.channel & 0x0f;
+            let key = n.key & 0x7f;
+            events.push((
+                n.start,
+                2,
+                vec![0x90 | channel, key, n.velocity.clamp(1, 127)],
+            ));
+            events.push((
+                n.start + n.length.max(1),
+                0,
+                vec![0x80 | channel, key, n.release & 0x7f],
+            ));
+        }
+        // Notes in order of key within that, so the result is always the same.
+        events
+            .sort_by_key(|(tick, rank, midi)| (*tick, *rank, if *rank == 1 { 0 } else { midi[1] }));
+        Clip {
+            start: self.start,
+            events: events
+                .into_iter()
+                .map(|(tick, _, midi)| (tick, midi))
+                .collect(),
+        }
+    }
 }
 
 /// How a track goes into the mix.
@@ -726,6 +856,104 @@ mod tests {
         assert_eq!(project.end(), 961);
         project.tracks.push(Track::new(synth()));
         assert_eq!(project.end(), 961);
+    }
+
+    fn phrase() -> Clip {
+        // A pedal, a note held by it, a chord with a key struck again.
+        Clip {
+            start: 960,
+            events: vec![
+                (0, vec![0xb0, 64, 127]),
+                (0, vec![0x90, 60, 100]),
+                (240, vec![0x80, 60, 40]),
+                (480, vec![0xb0, 64, 0]),
+                (480, vec![0x90, 64, 90]),
+                (480, vec![0x90, 67, 90]),
+                (720, vec![0x80, 64, 64]),
+                (720, vec![0x90, 64, 80]),
+                (960, vec![0x80, 64, 64]),
+                (960, vec![0x80, 67, 64]),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_clip_comes_apart_into_notes_and_back() {
+        let clip = phrase();
+        let (notes, others) = clip.notes();
+        let note = |start, length, key, velocity, release| Note {
+            start,
+            length,
+            channel: 0,
+            key,
+            velocity,
+            release,
+        };
+        assert_eq!(
+            notes,
+            [
+                note(0, 240, 60, 100, 40),
+                note(480, 240, 64, 90, 64),
+                note(480, 480, 67, 90, 64),
+                note(720, 240, 64, 80, 64),
+            ]
+        );
+        assert_eq!(others, [(0, vec![0xb0, 64, 127]), (480, vec![0xb0, 64, 0])]);
+        // Put back as it was: the note off before the key is struck again.
+        assert_eq!(clip.with_notes(&notes, &others), clip);
+    }
+
+    #[test]
+    fn a_recorded_clip_comes_apart_and_back_unchanged() {
+        for format in ["clap", "vst3"] {
+            let path = format!(
+                "{}/../../tests/projects/phrase-{format}.refrain",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let project = Project::read(Path::new(&path)).unwrap();
+            let clip = &project.tracks[0].clips[0];
+            let (notes, others) = clip.notes();
+            assert_eq!(notes.len(), 7);
+            assert_eq!(&clip.with_notes(&notes, &others), clip, "{format}");
+        }
+    }
+
+    #[test]
+    fn odd_clips_come_apart_without_losing_anything() {
+        let clip = Clip {
+            start: 0,
+            events: vec![
+                (0, vec![0x80, 50, 64]),   // an off with no on
+                (10, vec![0x90, 60, 100]), // an on with no off
+                (20, vec![0x90, 62, 100]),
+                (30, vec![0x90, 62, 0]), // an off written as an on
+                (100, vec![0xe0, 0, 64]),
+            ],
+        };
+        let (notes, others) = clip.notes();
+        assert_eq!(notes.len(), 2);
+        assert_eq!((notes[0].key, notes[0].length), (60, 90));
+        assert_eq!((notes[1].key, notes[1].length), (62, 10));
+        assert_eq!(others.len(), 2);
+        let back = clip.with_notes(&notes, &others);
+        // Every note now has its off; nothing else changed.
+        assert_eq!(back.notes(), (notes, others));
+    }
+
+    #[test]
+    fn clips_move_copy_after_themselves_and_go() {
+        let mut track = Track::new(sample().tracks[0].instrument.clone());
+        track.clips.push(phrase());
+        track.move_clip(0, 1_920);
+        assert_eq!(track.clips[0].start, 1_920);
+        // From 1920 to 2880; the next bar of 3840 ticks starts at 3840.
+        let copy = track.duplicate_clip(0, 3_840).unwrap();
+        assert_eq!(track.clips[copy].start, 3_840);
+        assert_eq!(track.clips[copy].events, track.clips[0].events);
+        assert!(track.remove_clip(0).is_some());
+        assert_eq!(track.clips.len(), 1);
+        assert!(track.remove_clip(5).is_none());
+        assert!(track.duplicate_clip(5, 3_840).is_none());
     }
 
     #[test]

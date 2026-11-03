@@ -3,6 +3,7 @@
 
 mod app;
 mod fonts;
+mod piano;
 mod remote;
 mod view;
 

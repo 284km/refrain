@@ -7,10 +7,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use refrain_engine::{Mix, Mixer, Processor, TimedEvent};
+use refrain_engine::{Mix, Mixer, Processor, Sequence, TimedEvent};
 
 /// What the GUI asks of the mixer.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     Play,
     Stop,
@@ -20,6 +20,8 @@ pub enum Command {
     MasterVolume(f32),
     Click(bool),
     LiveTrack(usize),
+    /// Play this sequence on a track from now on.
+    Sequence(usize, Sequence),
 }
 
 /// Where the transport is, as the audio thread last saw it.
@@ -49,14 +51,22 @@ impl Status {
 pub struct Remote {
     mixer: Mixer,
     commands: rtrb::Consumer<Command>,
+    // Sequences that were replaced go back, to be freed off the audio thread.
+    spent: rtrb::Producer<Sequence>,
     status: Arc<Status>,
 }
 
 impl Remote {
-    pub fn new(mixer: Mixer, commands: rtrb::Consumer<Command>, status: Arc<Status>) -> Self {
+    pub fn new(
+        mixer: Mixer,
+        commands: rtrb::Consumer<Command>,
+        spent: rtrb::Producer<Sequence>,
+        status: Arc<Status>,
+    ) -> Self {
         Self {
             mixer,
             commands,
+            spent,
             status,
         }
     }
@@ -71,6 +81,11 @@ impl Remote {
             Command::MasterVolume(db) => m.set_master_volume(db),
             Command::Click(on) => m.set_click(on),
             Command::LiveTrack(track) => m.set_live_track(track),
+            Command::Sequence(track, sequence) => {
+                let old = m.set_sequence(track, sequence).unwrap_or_else(|new| new);
+                // With the queue full, the old one is freed here after all.
+                let _ = self.spent.push(old);
+            }
         }
     }
 }
@@ -99,7 +114,7 @@ impl Processor for Remote {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use refrain_engine::{Sine, Track};
+    use refrain_engine::{Event, Sine, Track};
 
     #[test]
     fn commands_take_effect_at_the_next_block() {
@@ -113,8 +128,9 @@ mod tests {
         )
         .stopped();
         let (mut to_audio, commands) = rtrb::RingBuffer::new(16);
+        let (spent, mut freed) = rtrb::RingBuffer::new(4);
         let status = Arc::new(Status::default());
-        let mut remote = Remote::new(mixer, commands, Arc::clone(&status));
+        let mut remote = Remote::new(mixer, commands, spent, Arc::clone(&status));
         remote.prepare(48_000.0, 128);
         let mut out = vec![0.0; 256];
         remote.process(&mut out, 2, &[]);
@@ -134,5 +150,20 @@ mod tests {
         remote.process(&mut out, 2, &[]);
         assert!(out.iter().all(|&s| s == 0.0));
         assert_eq!((status.playhead(), status.playing()), (1_128, false));
+
+        // A replaced sequence comes back to be freed.
+        let note = Event::NoteOn {
+            channel: 0,
+            key: 60,
+            velocity: 1.0,
+        };
+        to_audio
+            .push(Command::Sequence(0, vec![(2_000, note)]))
+            .unwrap();
+        remote.process(&mut out, 2, &[]);
+        assert_eq!(freed.pop(), Ok(Vec::new()));
+        to_audio.push(Command::Sequence(0, Vec::new())).unwrap();
+        remote.process(&mut out, 2, &[]);
+        assert_eq!(freed.pop(), Ok(vec![(2_000, note)]));
     }
 }

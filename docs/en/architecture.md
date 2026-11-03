@@ -305,9 +305,27 @@ from the plugins' buttons.
   (play, stop, locate, a track's mix, the master volume, the click, the live
   track) and publishes the playhead through atomics. Mix changes are heard
   from the next block, while playing.
-- **Changes to what plays rebuild the mixer.** A new clip or a new tempo
-  stops the stream, activates every plugin again and starts it at the same
-  playhead. It takes a moment, so it only happens while stopped.
+- **Clip edits are heard at once.** A clip that is recorded, moved,
+  duplicated, deleted or has its notes edited reaches the audio thread as
+  the track's new sequence, through the command queue; the mixer takes it
+  from the playhead on and releases that track's notes, since the note offs
+  of the old sequence may be gone. The old sequence comes back through
+  another queue, so it is freed off the audio thread. No plugin is
+  activated again, so this works while playing.
+- **Changes to the tracks or the tempo rebuild the mixer.** They stop the
+  stream, activate every plugin again and start it at the same playhead.
+- **Notes.** A clip keeps MIDI messages; the piano roll works on notes. A
+  note on goes with the next note off of its key and channel, and a note
+  left on ends with the clip; controllers and the like stay as they are.
+  Putting the notes back writes note offs before other events, and those
+  before note ons, at the same tick, so a key struck again where it was let
+  go sounds. Recorded clips come apart and back unchanged.
+- **Undo** keeps copies of every track's clips from before each clip or note
+  edit. Adding or removing a track or an effect forgets them, since undoing
+  across it would need plugins that are gone.
+- **Drags** are remembered while they last, since egui no longer says how
+  far a widget was dragged on the frame it is let go. Tests caught that the
+  first version moved nothing.
 - **Recording** starts playing at the playhead and collects what comes in
   from MIDI, stamped by the MIDI thread. Stopping turns it into a clip that
   starts where the recording began, on the track MIDI goes to.
@@ -352,8 +370,8 @@ from the plugins' buttons.
   clip, means activating the plugins again, which refrain does while
   stopped. There are no sends, buses or groups, no automation, and effects
   get no MIDI and no side chain.
-- **refrain's window** cannot edit clips, reorder effects, or rename tracks
-  yet. Its timeline always fits the whole song, without zooming or scrolling
+- **refrain's window** cannot reorder effects, rename tracks, split or
+  resize clips, or edit velocities and controllers yet. Its timeline always fits the whole song, without zooming or scrolling
   sideways. On macOS the system's file dialog may not let a `.clap` or
   `.vst3` bundle be picked, as it is a folder; the chooser's list and its
   path field can.
@@ -394,7 +412,9 @@ device:
   time, and telling a CLAP plugin real time when offline was asked for. For
   the transport: stopping without releasing the instruments' notes, moving
   the playhead while stopped, and moving the playhead without moving the
-  sequences along. The pan
+  sequences along. For editing: swapping a track's sequence without
+  releasing its notes, and writing a note on before a note off at the same
+  tick. The pan
   swap first passed the engine's tests, whose levels added up the same with
   the sides swapped; the levels were changed so they no longer do. CI's mix
   check caught it, and the mix not being passed on, from the peaks of each

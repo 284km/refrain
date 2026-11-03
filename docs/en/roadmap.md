@@ -16,7 +16,7 @@ heard or checked on both macOS and Windows.
 | 7 | Render a project to a WAV file | Done. Renders until the sound dies away, with plugins told it is offline, to 32-bit float or 16- or 24-bit integers with optional dither; CI checks the length, the file sizes and that dither is the same every time |
 | 8 | refrain's own window: transport, tracks, clips and the mixer | Done. `refrain gui` plays, stops, locates and records, changes the mix while playing, shows the clips and opens plugins' editors; clicking through it is tested without a screen, and CI opens it on macOS and Windows |
 | 8b | Adding, removing and choosing plugins in the window; opening and saving projects under other names | Done. A chooser lists installed plugin files and the project's, and the plugins a file holds; menus remove tracks and effects; New, Open and Save as. The window's handling is tested with the in-process test plugins |
-| 9 | Editing clips: moving, copying and deleting them, and their notes in a piano roll | Next |
+| 9 | Editing clips: moving, copying and deleting them, and their notes in a piano roll | Done. Clips move by beats, duplicate and delete, and their notes are added, moved, resized and removed in a piano roll, with undo; edits are heard at once, while playing too |
 
 ## Alongside the steps
 

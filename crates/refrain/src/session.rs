@@ -303,14 +303,18 @@ impl Session {
         live: usize,
         extra: &[(u64, Event)],
     ) -> Result<Mixer> {
-        let tempo = self.tempo();
         let mut tracks = Vec::new();
-        for (t, (track, loaded)) in self.project.tracks.iter().zip(&mut self.tracks).enumerate() {
-            let mut sequence: Vec<(u64, Event)> = track
-                .sequence()
-                .into_iter()
-                .map(|(tick, event)| (tempo.frame_at(tick, sample_rate), event))
-                .collect();
+        let sequences: Vec<_> = (0..self.tracks.len())
+            .map(|t| self.sequence(t, sample_rate))
+            .collect();
+        for (t, ((track, loaded), mut sequence)) in self
+            .project
+            .tracks
+            .iter()
+            .zip(&mut self.tracks)
+            .zip(sequences)
+            .enumerate()
+        {
             if t == live {
                 sequence.extend_from_slice(extra);
             }
@@ -327,6 +331,18 @@ impl Session {
             .map(|e| e.activate(sample_rate, max_block_frames))
             .collect::<Result<_>>()?;
         Ok(Mixer::new(tracks, master, self.project.master.volume_db).with_live_track(live))
+    }
+
+    /// Track `track`'s clips as events at frames from the start, at
+    /// `sample_rate`, in order.
+    pub fn sequence(&self, track: usize, sample_rate: f32) -> Vec<(u64, Event)> {
+        let tempo = self.tempo();
+        self.project.tracks.get(track).map_or_else(Vec::new, |t| {
+            t.sequence()
+                .into_iter()
+                .map(|(tick, event)| (tempo.frame_at(tick, sample_rate), event))
+                .collect()
+        })
     }
 
     /// Adds a clip to track `track` at tick `start`, holding `events` at

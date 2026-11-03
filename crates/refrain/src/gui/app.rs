@@ -10,13 +10,15 @@ use std::time::{Duration, Instant};
 use egui::ViewportId;
 use egui_wgpu::winit::Painter;
 use egui_wgpu::{RendererOptions, WgpuConfiguration};
-use refrain_engine::{Event, MAX_BLOCK_FRAMES, Recording, Tempo};
+use refrain_engine::{Event, MAX_BLOCK_FRAMES, Recording, Sequence, TICKS_PER_BEAT, Tempo};
+use refrain_project::{Clip, Track};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
+use super::piano::PianoView;
 use super::remote::{Command, Remote, Status};
 use super::view::{self, Action, ChooserView, FileView, Model, Purpose, TrackView};
 use crate::audio::Output;
@@ -75,8 +77,15 @@ struct Audio {
     // Field order is drop order: the stream stops before MIDI is let go.
     _stream: cpal::Stream,
     commands: rtrb::Producer<Command>,
+    // Sequences the audio thread is done with, to be freed here.
+    spent: rtrb::Consumer<Sequence>,
     _midi: Option<midi::Connection>,
 }
+
+/// Every track's clips, as they were before an edit.
+type Snapshot = Vec<Vec<Clip>>;
+
+const TICKS_PER_BAR: u64 = 4 * TICKS_PER_BEAT;
 
 /// A recording in progress.
 struct Take {
@@ -115,6 +124,10 @@ struct Gui {
     // How plugins are found and loaded; tests load them in-process.
     list_file: ListFile,
     open_plugin: OpenPlugin,
+    selected: Option<(usize, usize)>,
+    piano: Option<(usize, usize)>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
 }
 
 type ListFile = unsafe fn(&Path) -> Result<Vec<Choice>>;
@@ -164,6 +177,10 @@ impl Gui {
             confirm: None,
             list_file: plugin::list_file,
             open_plugin: Kind::open,
+            selected: None,
+            piano: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
         };
         gui.retitle();
         gui
@@ -206,12 +223,14 @@ impl Gui {
             }
         };
         self.status = Arc::new(Status::default());
-        let remote = Remote::new(mixer, from_gui, Arc::clone(&self.status));
+        let (to_free, spent) = rtrb::RingBuffer::new(64);
+        let remote = Remote::new(mixer, from_gui, to_free, Arc::clone(&self.status));
         let stream = output.start(remote, Some(from_midi))?;
         self.recorded = Some(recorded);
         self.audio = Some(Audio {
             _stream: stream,
             commands,
+            spent,
             _midi: midi,
         });
         Ok(())
@@ -294,7 +313,90 @@ impl Gui {
                 plugins: c.plugins.clone(),
                 path: c.path.clone(),
             }),
+            selected: self.selected,
+            piano: self.piano.and_then(|(t, c)| {
+                let clip = project.tracks.get(t)?.clips.get(c)?;
+                let (notes, _) = clip.notes();
+                let end = notes
+                    .iter()
+                    .map(|n| n.start + n.length)
+                    .fold(clip.length(), u64::max);
+                // The clip and a bar or so after it, in whole bars.
+                let length = (end + 2 * TICKS_PER_BEAT).div_ceil(TICKS_PER_BAR) * TICKS_PER_BAR;
+                Some(PianoView {
+                    track: t,
+                    clip: c,
+                    notes,
+                    length: length.max(4 * TICKS_PER_BAR),
+                })
+            }),
+            can_undo: !self.undo.is_empty(),
+            can_redo: !self.redo.is_empty(),
         }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        self.session
+            .project
+            .tracks
+            .iter()
+            .map(|t| t.clips.clone())
+            .collect()
+    }
+
+    /// Plays track `t`'s clips as they are now, from the next block.
+    fn resend(&mut self, t: usize) {
+        let sequence = self.session.sequence(t, self.rate());
+        self.send(Command::Sequence(t, sequence));
+    }
+
+    /// Changes track `t`'s clips with `f`, which says whether it changed
+    /// anything. The change can be undone, and is heard from the next block.
+    fn edit_clips(&mut self, t: usize, f: impl FnOnce(&mut Track) -> bool) -> bool {
+        let before = self.snapshot();
+        let Some(track) = self.session.project.tracks.get_mut(t) else {
+            return false;
+        };
+        if !f(track) {
+            return false;
+        }
+        self.undo.push(before);
+        self.redo.clear();
+        self.dirty = true;
+        self.resend(t);
+        true
+    }
+
+    /// Puts every track's clips back as `snapshot` has them, and returns how
+    /// they were.
+    fn restore(&mut self, snapshot: Snapshot) -> Snapshot {
+        let now = self.snapshot();
+        for (track, clips) in self.session.project.tracks.iter_mut().zip(snapshot) {
+            track.clips = clips;
+        }
+        for t in 0..self.session.project.tracks.len() {
+            self.resend(t);
+        }
+        self.dirty = true;
+        // A clip that is gone can be neither picked nor edited.
+        let exists = |p: &Option<(usize, usize)>, s: &Session| {
+            p.is_some_and(|(t, c)| s.project.tracks.get(t).is_some_and(|t| c < t.clips.len()))
+        };
+        if !exists(&self.selected, &self.session) {
+            self.selected = None;
+        }
+        if !exists(&self.piano, &self.session) {
+            self.piano = None;
+        }
+        now
+    }
+
+    /// Forgets what could be undone, after the tracks themselves changed.
+    fn forget_edits(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.selected = None;
+        self.piano = None;
     }
 
     fn act(&mut self, action: Action) {
@@ -431,6 +533,73 @@ impl Gui {
                     self.message = "removed the effect".into();
                 }
             }
+            Action::SelectClip(selected) => self.selected = selected,
+            Action::MoveClip(t, c, start) => {
+                if self.edit_clips(t, |track| {
+                    let moved = track.clips.get(c).is_some_and(|clip| clip.start != start);
+                    track.move_clip(c, start);
+                    moved
+                }) {
+                    self.selected = Some((t, c));
+                }
+            }
+            Action::DuplicateClip(t, c) => {
+                let mut copy = None;
+                self.edit_clips(t, |track| {
+                    copy = track.duplicate_clip(c, TICKS_PER_BAR);
+                    copy.is_some()
+                });
+                if let Some(copy) = copy {
+                    self.selected = Some((t, copy));
+                }
+            }
+            Action::DeleteClip(t, c) => {
+                if self.edit_clips(t, |track| track.remove_clip(c).is_some()) {
+                    // Clips after it on the track move up.
+                    self.selected = None;
+                    if self.piano.is_some_and(|(pt, _)| pt == t) {
+                        self.piano = None;
+                    }
+                }
+            }
+            Action::OpenPiano(t, c) => {
+                let exists = self
+                    .session
+                    .project
+                    .tracks
+                    .get(t)
+                    .is_some_and(|track| c < track.clips.len());
+                if exists {
+                    self.piano = Some((t, c));
+                    self.selected = Some((t, c));
+                }
+            }
+            Action::ClosePiano => self.piano = None,
+            Action::SetNotes(t, c, notes) => {
+                self.edit_clips(t, |track| {
+                    let Some(clip) = track.clips.get(c) else {
+                        return false;
+                    };
+                    let (old, others) = clip.notes();
+                    if old == notes {
+                        return false;
+                    }
+                    track.clips[c] = clip.with_notes(&notes, &others);
+                    true
+                });
+            }
+            Action::Undo => {
+                if let Some(snapshot) = self.undo.pop() {
+                    let now = self.restore(snapshot);
+                    self.redo.push(now);
+                }
+            }
+            Action::Redo => {
+                if let Some(snapshot) = self.redo.pop() {
+                    let now = self.restore(snapshot);
+                    self.undo.push(now);
+                }
+            }
         }
     }
 
@@ -453,6 +622,7 @@ impl Gui {
         while !self.editors.is_empty() {
             self.close_editor(0);
         }
+        self.forget_edits();
         let frame = self.stop_audio();
         let result = f(&mut self.session);
         if let Err(e) = &result {
@@ -563,6 +733,7 @@ impl Gui {
         self.stop_audio();
         self.take = None;
         self.chooser = None;
+        self.forget_edits();
         self.session = session;
         self.save_to = save_to;
         self.live = 0;
@@ -629,14 +800,16 @@ impl Gui {
         let tempo = self.session.tempo();
         let played = take.events.finish(take.since.elapsed().as_secs_f64());
         let (start, events) = clip_from(&played, take.from, tempo);
-        self.session.add_clip(self.live, start, &events);
-        self.dirty = true;
+        let count = events.len();
+        let live = self.live;
+        self.edit_clips(live, |track| {
+            track.add_clip(start, &events);
+            true
+        });
         self.message = format!(
-            "recorded {} events into a new clip on track {}",
-            events.len(),
-            self.live + 1
+            "recorded {count} events into a new clip on track {}",
+            live + 1
         );
-        self.rebuild();
     }
 
     fn save(&mut self) {
@@ -755,6 +928,9 @@ impl ApplicationHandler for Gui {
         }
         self.session.poll_main_thread();
         self.collect_midi();
+        if let Some(audio) = &mut self.audio {
+            while audio.spent.pop().is_ok() {}
+        }
         let mut i = 0;
         while i < self.editors.len() {
             if self.editors[i].poll(&mut self.session) {
@@ -1015,6 +1191,114 @@ mod flow_tests {
         let model = gui.model();
         assert!(model.tracks[0].effects.is_empty());
         assert_eq!(model.master_effects.len(), 1);
+    }
+
+    /// A window with one track, holding one clip of a C at its start.
+    fn with_a_clip() -> Gui {
+        let mut gui = gui();
+        pick(&mut gui, Purpose::Track, "refrain test synth");
+        let on = Event::NoteOn {
+            channel: 0,
+            key: 60,
+            velocity: 100.0 / 127.0,
+        };
+        let off = Event::NoteOff {
+            channel: 0,
+            key: 60,
+            velocity: 64.0 / 127.0,
+        };
+        gui.session.project.tracks[0].add_clip(0, &[(0, on), (480, off)]);
+        gui.dirty = false;
+        gui
+    }
+
+    fn starts(gui: &Gui) -> Vec<u64> {
+        gui.session.project.tracks[0]
+            .clips
+            .iter()
+            .map(|c| c.start)
+            .collect()
+    }
+
+    #[test]
+    fn clips_move_copy_and_go_and_every_edit_can_be_undone() {
+        let mut gui = with_a_clip();
+        assert!(!gui.model().can_undo);
+        gui.act(Action::MoveClip(0, 0, 1_920));
+        assert_eq!(starts(&gui), [1_920]);
+        assert!(gui.model().dirty && gui.model().can_undo);
+        gui.act(Action::DuplicateClip(0, 0));
+        // After the clip, at the next bar.
+        assert_eq!(starts(&gui), [1_920, 3_840]);
+        assert_eq!(gui.model().selected, Some((0, 1)));
+        gui.act(Action::DeleteClip(0, 0));
+        assert_eq!(starts(&gui), [3_840]);
+        assert_eq!(gui.model().selected, None);
+
+        gui.act(Action::Undo);
+        assert_eq!(starts(&gui), [1_920, 3_840]);
+        gui.act(Action::Undo);
+        gui.act(Action::Undo);
+        assert_eq!(starts(&gui), [0]);
+        assert!(!gui.model().can_undo && gui.model().can_redo);
+        gui.act(Action::Redo);
+        assert_eq!(starts(&gui), [1_920]);
+        // A new edit forgets what could be redone.
+        gui.act(Action::MoveClip(0, 0, 0));
+        assert!(!gui.model().can_redo);
+        // Moving a clip where it is changes nothing to undo.
+        let undoable = gui.undo.len();
+        gui.act(Action::MoveClip(0, 0, 0));
+        assert_eq!(gui.undo.len(), undoable);
+    }
+
+    #[test]
+    fn the_piano_roll_edits_notes_and_keeps_the_rest() {
+        let mut gui = with_a_clip();
+        // A pedal in the clip, which the piano roll does not show.
+        gui.session.project.tracks[0].clips[0]
+            .events
+            .insert(0, (0, vec![0xb0, 64, 127]));
+        gui.act(Action::OpenPiano(0, 0));
+        let piano = gui.model().piano.expect("the piano roll is open");
+        assert_eq!(piano.notes.len(), 1);
+        assert_eq!(piano.length % TICKS_PER_BAR, 0);
+        let mut notes = piano.notes.clone();
+        notes[0].key = 64;
+        notes.push(refrain_project::Note {
+            start: 960,
+            key: 67,
+            ..notes[0]
+        });
+        gui.act(Action::SetNotes(0, 0, notes.clone()));
+        assert_eq!(gui.model().piano.unwrap().notes, notes);
+        let clip = &gui.session.project.tracks[0].clips[0];
+        assert!(clip.events.contains(&(0, vec![0xb0, 64, 127])));
+        // What plays is what the piano roll shows.
+        let keys: Vec<u8> = gui.session.project.tracks[0]
+            .sequence()
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                Event::NoteOn { key, .. } => Some(key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, [64, 67]);
+        gui.act(Action::Undo);
+        assert_eq!(gui.model().piano.unwrap().notes[0].key, 60);
+        // Deleting the clip closes its piano roll.
+        gui.act(Action::DeleteClip(0, 0));
+        assert!(gui.model().piano.is_none());
+    }
+
+    #[test]
+    fn changing_the_tracks_forgets_what_could_be_undone() {
+        let mut gui = with_a_clip();
+        gui.act(Action::MoveClip(0, 0, 960));
+        pick(&mut gui, Purpose::Track, "refrain test synth");
+        assert!(!gui.model().can_undo);
+        gui.act(Action::Undo);
+        assert_eq!(starts(&gui), [960]);
     }
 
     #[test]
