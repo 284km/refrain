@@ -4,10 +4,9 @@ A DAW for macOS and Windows, written in Rust.
 
 [日本語](README.ja.md)
 
-> Status: very early. refrain hosts CLAP instruments and plays them from a MIDI
-> input, sustain pedal and pitch bend included, on an audio device or offline
-> into a WAV file. There is no GUI yet,
-> only the `refrain` command.
+> Status: very early. refrain hosts CLAP and VST3 instruments and plays them
+> from a MIDI input, sustain pedal and pitch bend included, on an audio device
+> or offline into a WAV file. There is no GUI yet, only the `refrain` command.
 
 ## Goals
 
@@ -19,13 +18,18 @@ A DAW for macOS and Windows, written in Rust.
 
 ```
 crates/
-  refrain-engine/      the real-time engine. No OS or device code.
-  refrain-clap/        hosts CLAP plugins inside the engine
-  refrain-test-synth/  a small CLAP instrument, used to test hosting
-  refrain/             the `refrain` command: audio devices, MIDI, WAV output
+  refrain-engine/           the real-time engine. No OS or device code.
+  refrain-clap/             hosts CLAP plugins inside the engine
+  refrain-vst3/             hosts VST3 plugins inside the engine
+  refrain-test-tone/        the sound of the test plugins
+  refrain-test-synth/       CLAP test plugins, used to test hosting
+  refrain-test-synth-vst3/  VST3 test plugins that sound the same
+  refrain/                  the `refrain` command: audio devices, MIDI, WAV output
+scripts/
+  build-test-plugins.sh     builds the test plugins as .clap and .vst3 files
 docs/
-  en/                  documentation in English
-  ja/                  documentation in Japanese
+  en/                       documentation in English
+  ja/                       documentation in Japanese
 ```
 
 The engine runs the same way inside a device callback and in an offline
@@ -39,26 +43,25 @@ You need [rustup](https://rustup.rs/). The toolchain version is pinned in
 ```sh
 cargo run -- devices                       # list audio output devices
 cargo run -- midi                          # list MIDI inputs
-cargo run -- plugins                       # list installed CLAP plugins
+cargo run -- plugins                       # list installed CLAP and VST3 plugins
 cargo run -- sine --freq 440 --seconds 2   # play a sine wave
 cargo test
 ```
 
-To hear a CLAP instrument, build the test synth and play it. With a MIDI
+To hear an instrument, build the test plugins and play one. With a MIDI
 keyboard connected, play it from the keyboard; without one, `--demo` plays a
 short phrase:
 
 ```sh
-cargo build -p refrain-test-synth
-cargo run -- play target/debug/librefrain_test_synth.dylib           # from a MIDI keyboard
-cargo run -- play target/debug/librefrain_test_synth.dylib --demo    # a short phrase
-cargo run -- render out.wav --plugin target/debug/librefrain_test_synth.dylib
+scripts/build-test-plugins.sh
+cargo run -- play target/test-plugins/refrain-test-synth.clap          # from a MIDI keyboard
+cargo run -- play target/test-plugins/refrain-test-synth.vst3 --demo   # a short phrase
+cargo run -- render out.wav --plugin target/test-plugins/refrain-test-synth.vst3
 ```
 
-On Windows the file is `target\debug\refrain_test_synth.dll`.
-
-An installed instrument works the same way: pass its `.clap` file. Loading a
-plugin runs its code inside refrain.
+An installed instrument works the same way: pass its `.clap` or `.vst3`
+file or bundle. When a file holds several plugins, `--id` chooses one
+(for VST3, by name or class ID). Loading a plugin runs its code inside refrain.
 
 ## Documentation
 

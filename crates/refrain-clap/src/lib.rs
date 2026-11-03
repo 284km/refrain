@@ -29,7 +29,7 @@ use clack_host::prelude::*;
 /// A loaded CLAP file. Get one from [`load_entry`].
 pub use clack_host::entry::PluginEntry;
 use refrain_engine::{
-    Event, MAX_BLOCK_EVENTS, MAX_PEDAL_RELEASES, Processor, SustainPedal, TimedEvent,
+    Event, MAX_BLOCK_EVENTS, MAX_PEDAL_RELEASES, Processor, SustainPedal, TimedEvent, interleave,
 };
 
 /// What a plugin says about itself.
@@ -555,24 +555,11 @@ impl Processor for ClapProcessor {
             return;
         }
 
-        // Interleave the main output into `out`. A mono plugin goes to every
-        // channel; a stereo plugin on a mono device is mixed down; extra device
-        // channels stay silent.
         let main = &self.outputs[self.main_output];
-        let plugin_channels = main.len() / max;
-        for (i, frame) in out.chunks_exact_mut(channels).enumerate() {
-            if channels == 1 && plugin_channels > 1 {
-                let sum: f32 = (0..plugin_channels).map(|c| main[c * max + i]).sum();
-                frame[0] = sum / plugin_channels as f32;
-                continue;
-            }
-            for (c, sample) in frame.iter_mut().enumerate() {
-                *sample = match plugin_channels {
-                    1 => main[i],
-                    n if c < n => main[c * max + i],
-                    _ => 0.0,
-                };
-            }
-        }
+        interleave(main, main.len() / max, max, out, channels);
+    }
+
+    fn has_failed(&self) -> bool {
+        self.failed
     }
 }

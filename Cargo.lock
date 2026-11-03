@@ -141,6 +141,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a76abbdb2907f6fd97fb6bc0b7be96b77d328f2dd9669d1075cc03369ed22154"
 
 [[package]]
+name = "com-scrape-types"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ce183b975b8fc736a20919c4002717255fbd867df575c792aeefa9a56a73ad0"
+
+[[package]]
 name = "combine"
 version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -459,6 +465,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -757,6 +773,7 @@ dependencies = [
  "midir",
  "refrain-clap",
  "refrain-engine",
+ "refrain-vst3",
  "rtrb",
 ]
 
@@ -780,6 +797,32 @@ version = "0.0.1"
 dependencies = [
  "clack-extensions",
  "clack-plugin",
+ "refrain-test-tone",
+]
+
+[[package]]
+name = "refrain-test-synth-vst3"
+version = "0.0.1"
+dependencies = [
+ "refrain-test-tone",
+ "vst3",
+]
+
+[[package]]
+name = "refrain-test-tone"
+version = "0.0.1"
+
+[[package]]
+name = "refrain-vst3"
+version = "0.0.1"
+dependencies = [
+ "clack-host",
+ "libloading 0.9.0",
+ "refrain-clap",
+ "refrain-engine",
+ "refrain-test-synth",
+ "refrain-test-synth-vst3",
+ "vst3",
 ]
 
 [[package]]
@@ -975,6 +1018,15 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "vst3"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e31e3fe7a6f028ded8c5a9984cf283319e6dc63572c9b71da1d4ee9d71d3b6bf"
+dependencies = [
+ "com-scrape-types",
+]
 
 [[package]]
 name = "walkdir"

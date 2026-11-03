@@ -1,10 +1,8 @@
 //! A small CLAP instrument for testing refrain's plugin hosting.
 //!
-//! Each note is a sine wave at the note's pitch, with an amplitude of
-//! `velocity * PEAK` and a linear 5 ms fade in and out. The output is stereo:
-//! the right channel is the left one times [`RIGHT_GAIN`], so a host that
-//! swaps or duplicates channels shows up in tests. Everything is
-//! deterministic, so a host can check what it hears against what it sent.
+//! It plays [`refrain_test_tone::Tone`], the same sound as the VST3 test
+//! plugin, so a host can check what it hears against what it sent, and both
+//! plugin formats against each other.
 //!
 //! The file holds two plugins that sound the same:
 //!
@@ -34,25 +32,8 @@ pub const ID: &str = "dev.refrain.test-synth";
 /// The plugin that takes notes only.
 pub const NOTES_ONLY_ID: &str = "dev.refrain.test-synth.notes-only";
 
-/// Amplitude of a note at full velocity.
-pub const PEAK: f32 = 0.2;
-
-/// The right channel is the left channel times this. A power of two, so the
-/// product is exact.
-pub const RIGHT_GAIN: f32 = 0.5;
-
-/// Length of the fade in and the fade out.
-pub const FADE_SECONDS: f32 = 0.005;
-
-/// How far a full pitch bend goes, in semitones.
-pub const BEND_SEMITONES: f64 = 2.0;
-
-const VOICES: usize = 16;
-
-/// The pitch of a MIDI key, with A4 (key 69) at 440 Hz.
-pub fn key_frequency(key: u8) -> f64 {
-    440.0 * 2f64.powf((f64::from(key) - 69.0) / 12.0)
-}
+use refrain_test_tone::Tone;
+pub use refrain_test_tone::{BEND_SEMITONES, FADE_SECONDS, PEAK, RIGHT_GAIN, key_frequency};
 
 pub struct TestSynth;
 
@@ -144,137 +125,31 @@ impl PluginFactoryImpl for Factory {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct Voice {
-    active: bool,
-    channel: u16,
-    key: u16,
-    // Kept in [0, 1) and in f64, so the pitch does not drift.
-    phase: f64,
-    // Phase step at the key's own pitch, before pitch bend.
-    base_step: f64,
-    gain: f32,
-    level: f32,
-    releasing: bool,
-    // Released by the player while the pedal was down.
-    held: bool,
-}
-
 pub struct SynthProcessor<'a> {
     shared: &'a SynthShared,
-    voices: [Voice; VOICES],
-    sample_rate: f64,
-    fade_step: f32,
-    pedal_down: [bool; 16],
-    // Pitch factor per MIDI channel, from pitch bend.
-    bend: [f64; 16],
+    tone: Tone,
 }
 
 impl SynthProcessor<'_> {
-    fn note_on(&mut self, channel: u16, key: u16, velocity: f64) {
-        // Striking a key the pedal holds releases the old voice. Without the
-        // pedal, a repeated note simply adds a voice, so a host that forgets
-        // to release held notes is heard.
-        self.release(|v| v.channel == channel && v.key == key && v.held);
-        // Reuse a free voice. When all are busy, the new note is dropped.
-        let Some(voice) = self.voices.iter_mut().find(|v| !v.active) else {
-            return;
-        };
-        *voice = Voice {
-            active: true,
-            channel,
-            key,
-            phase: 0.0,
-            base_step: key_frequency(key.min(127) as u8) / self.sample_rate,
-            gain: velocity as f32 * PEAK,
-            level: 0.0,
-            releasing: false,
-            held: false,
-        };
-    }
-
-    fn note_off(&mut self, channel: Match<u16>, key: Match<u16>) {
-        let pedal = self.pedal_down;
-        for v in self.voices.iter_mut().filter(|v| v.active && !v.releasing) {
-            if channel.matches(v.channel) && key.matches(v.key) {
-                if pedal[usize::from(v.channel & 0x0f)] {
-                    v.held = true;
-                } else {
-                    v.releasing = true;
-                }
-            }
-        }
-    }
-
-    fn release(&mut self, pick: impl Fn(&Voice) -> bool) {
-        for v in self.voices.iter_mut().filter(|v| v.active && pick(v)) {
-            v.releasing = true;
-            v.held = false;
-        }
-    }
-
-    fn midi(&mut self, [status, a, b]: [u8; 3]) {
-        let channel = u16::from(status & 0x0f);
-        let c = usize::from(channel);
-        match (status & 0xf0, a) {
-            (0x90, _) if b > 0 => self.note_on(channel, a.into(), f64::from(b) / 127.0),
-            (0x80 | 0x90, _) => self.note_off(Match::Specific(channel), Match::Specific(a.into())),
-            (0xb0, 64) => {
-                let down = b >= 64;
-                if self.pedal_down[c] && !down {
-                    self.release(|v| v.channel == channel && v.held);
-                }
-                self.pedal_down[c] = down;
-            }
-            (0xb0, 123) => self.release(|v| v.channel == channel),
-            (0xe0, _) => {
-                let value = (u16::from(b) << 7 | u16::from(a)) as f64;
-                let semitones = (value - 8192.0) / 8192.0 * BEND_SEMITONES;
-                self.bend[c] = 2f64.powf(semitones / 12.0);
-            }
-            _ => {}
-        }
-    }
-
     fn handle(&mut self, event: &UnknownEvent) {
+        let specific = |m: Match<u16>| match m {
+            Match::Specific(v) => Some(v),
+            Match::All => None,
+        };
         match event.as_core_event() {
             Some(CoreEventSpace::NoteOn(e)) => {
                 if let (Match::Specific(channel), Match::Specific(key)) = (e.channel(), e.key()) {
-                    self.note_on(channel, key, e.velocity());
+                    self.tone.note_on(channel, key, e.velocity() as f32);
                 }
             }
-            Some(CoreEventSpace::NoteOff(e)) => self.note_off(e.channel(), e.key()),
+            Some(CoreEventSpace::NoteOff(e)) => {
+                self.tone.note_off(specific(e.channel()), specific(e.key()));
+            }
             Some(CoreEventSpace::NoteChoke(e)) => {
-                for v in self.voices.iter_mut() {
-                    if e.channel().matches(v.channel) && e.key().matches(v.key) {
-                        v.active = false;
-                    }
-                }
+                self.tone.choke(specific(e.channel()), specific(e.key()));
             }
-            Some(CoreEventSpace::Midi(e)) if self.shared.takes_midi => self.midi(e.data()),
+            Some(CoreEventSpace::Midi(e)) if self.shared.takes_midi => self.tone.midi(e.data()),
             _ => {}
-        }
-    }
-
-    fn render(&mut self, out: &mut [f32]) {
-        let bend = self.bend;
-        for v in self.voices.iter_mut().filter(|v| v.active) {
-            let step = v.base_step * bend[usize::from(v.channel & 0x0f)];
-            for sample in out.iter_mut() {
-                if v.releasing {
-                    v.level -= self.fade_step;
-                    if v.level <= 0.0 {
-                        v.active = false;
-                        break;
-                    }
-                } else if v.level < 1.0 {
-                    v.level = (v.level + self.fade_step).min(1.0);
-                }
-                let s = (std::f64::consts::TAU * v.phase).sin() as f32;
-                *sample += s * v.gain * v.level;
-                v.phase += step;
-                v.phase -= v.phase.floor();
-            }
         }
     }
 }
@@ -288,11 +163,7 @@ impl<'a> PluginAudioProcessor<'a, SynthShared, SynthMainThread<'a>> for SynthPro
     ) -> Result<Self, PluginError> {
         Ok(Self {
             shared,
-            voices: [Voice::default(); VOICES],
-            sample_rate: config.sample_rate,
-            fade_step: 1.0 / (FADE_SECONDS * config.sample_rate as f32),
-            pedal_down: [false; 16],
-            bend: [1.0; 16],
+            tone: Tone::new(config.sample_rate),
         })
     }
 
@@ -318,20 +189,18 @@ impl<'a> PluginAudioProcessor<'a, SynthShared, SynthMainThread<'a>> for SynthPro
             for event in batch.events() {
                 self.handle(event);
             }
-            self.render(&mut left[batch.sample_bounds()]);
+            self.tone.render(&mut left[batch.sample_bounds()]);
         }
 
         if channels.channel_count() > 1 {
             let (first, rest) = channels.split_at_mut(1);
             let first = first.channel(0).unwrap();
             for other in rest {
-                for (o, &s) in other.iter_mut().zip(first.iter()) {
-                    *o = s * RIGHT_GAIN;
-                }
+                Tone::write_right(first, other);
             }
         }
 
-        if self.voices.iter().any(|v| v.active) {
+        if self.tone.is_sounding() {
             Ok(ProcessStatus::Continue)
         } else {
             Ok(ProcessStatus::Sleep)
@@ -339,9 +208,7 @@ impl<'a> PluginAudioProcessor<'a, SynthShared, SynthMainThread<'a>> for SynthPro
     }
 
     fn stop_processing(&mut self) {
-        for v in self.voices.iter_mut() {
-            v.active = false;
-        }
+        self.tone.stop();
     }
 }
 

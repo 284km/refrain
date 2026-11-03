@@ -1,0 +1,19 @@
+[package]
+name = "refrain-vst3"
+description = "Hosts VST3 plugins inside the refrain engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+refrain-engine.workspace = true
+vst3 = "0.3"
+libloading = "0.9"
+
+[dev-dependencies]
+refrain-test-synth-vst3 = { path = "../refrain-test-synth-vst3" }
+refrain-clap = { path = "../refrain-clap" }
+refrain-test-synth = { path = "../refrain-test-synth" }
+clack-host = { version = "0.2", features = ["clack-plugin"] }

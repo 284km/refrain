@@ -68,22 +68,49 @@ Hosts CLAP plugins, using [`clack-host`](https://github.com/prokopyl/clack).
   processor is still alive at that point, clack leaks the instance instead of
   destroying it under the audio thread.
 
-### `refrain-test-synth`
+### `refrain-vst3`
 
-A small CLAP instrument, built in this repository so plugin hosting can be
-tested without third-party binaries. Each note is a sine wave at its pitch
+Hosts VST3 plugins, using the [`vst3`](https://github.com/coupler-rs/vst3-rs)
+bindings.
+
+- `Vst3Module` is a loaded `.vst3` bundle (macOS) or file (Windows). On macOS
+  it hands the module a real `CFBundleRef` in `bundleEntry`, as plugins expect.
+- `Vst3Plugin` lives on the main thread. It creates the component and the
+  controller, connects them through their connection points, passes the
+  component's state to the controller, and activates the main buses.
+- Activating gives a `Vst3Processor`, a `Processor` for the audio thread. It
+  calls `setProcessing` on its first block, on the audio thread.
+- VST3 has no MIDI controller events. At activation the host reads the
+  plugin's `IMidiMapping` for every channel and controller, pitch bend and
+  channel pressure included. Mapped controllers are sent as parameter changes
+  at their sample offsets; everything else goes through `SustainPedal`, as for
+  CLAP plugins that take notes only.
+- The event list and parameter changes handed to `process` are COM objects
+  that refrain implements. They are allocated at activation and reused.
+- As with CLAP, the stream has to stop before the `Vst3Plugin` is dropped;
+  otherwise the plugin is leaked rather than torn down under the audio thread.
+
+### Test plugins
+
+`refrain-test-tone` is a small sine synth. `refrain-test-synth` (CLAP) and
+`refrain-test-synth-vst3` (VST3) both play it, built in this repository so
+plugin hosting can be tested without third-party binaries. Each note is a sine wave at its pitch
 with a 5 ms fade in and out, and the right channel is the left one at half
 level. Being deterministic, it lets tests check exact answers. Being lopsided,
 it shows swapped or duplicated channels.
 
-The file holds two plugins that sound the same. `dev.refrain.test-synth` takes
-MIDI and plays the sustain pedal, pitch bend and All Notes Off itself.
-`dev.refrain.test-synth.notes-only` takes notes only, so refrain plays the
-pedal for it. Tests send both the same events and require the same samples,
-which checks refrain's pedal against the plugin's own.
+Each format has two plugins that sound the same. One takes controllers and
+plays the sustain pedal, pitch bend and All Notes Off itself: the CLAP one as
+MIDI, the VST3 one as parameters it maps through `IMidiMapping`. The other
+takes notes only, so refrain plays the pedal for it. Tests send all four the
+same events and require the same samples. That checks refrain's pedal against
+the plugins' own, and the CLAP host and the VST3 host against each other.
 
-Tests load it two ways: in-process, through clack's support for Rust plugins,
-and in CI from its built file, the way a real plugin is loaded.
+`scripts/build-test-plugins.sh` packages them the way plugins are installed,
+as bundles on macOS and single files on Windows, for CI and for trying them.
+
+Tests load them two ways: in-process, and in CI from their packaged files, the
+way a real plugin is loaded.
 
 ### `refrain`
 
@@ -108,6 +135,12 @@ the device's sample type.
   not send them yet.
 - **Plugin logs** are printed from whichever thread logs, which can be the
   audio thread.
+- **VST3 plugins' own edits are ignored.** When a plugin changes a parameter
+  itself, refrain does not pass the change from the controller to the
+  processor. This matters once plugin editors open, in step 3.
+- **VST3 messages.** refrain does not create `IMessage` objects for plugins.
+  The component and controller talk through their connection points directly,
+  which is enough for the plugins tried so far.
 - **Scanning loads every plugin in this process.** A plugin that crashes while
   being listed takes refrain down with it.
 
@@ -126,7 +159,9 @@ device:
   the wrong channel, skipping the mono mixdown, dropping controllers on the
   way to a MIDI plugin, skipping the host's pedal, not releasing a held key
   when it is struck again, ignoring All Notes Off, and treating a pedal value
-  of 64 as up. Each one fails a test. One of them first passed, because the
+  of 64 as up. For VST3: not sending mapped controllers, dropping the sample
+  offsets of notes or of parameter changes, normalizing pitch bend over 16384,
+  and never reading the MIDI mapping. Each one fails a test. One of them first passed, because the
   test synth hid the host's mistake; the synth was changed so it no longer
   does.
 

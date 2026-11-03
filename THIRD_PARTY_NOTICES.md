@@ -13,7 +13,9 @@ refrain is MIT-licensed and depends only on permissively licensed crates.
 | [rtrb](https://github.com/mgeier/rtrb) | MIT OR Apache-2.0 | Lock-free queue from the MIDI thread to the audio thread |
 | [clack-host](https://github.com/prokopyl/clack) | MIT OR Apache-2.0 | Hosting CLAP plugins |
 | [clack-extensions](https://github.com/prokopyl/clack) | MIT OR Apache-2.0 | CLAP extensions (audio ports, note ports, log, params) |
-| [clack-plugin](https://github.com/prokopyl/clack) | MIT OR Apache-2.0 | The test synth only, which is not part of refrain itself |
+| [clack-plugin](https://github.com/prokopyl/clack) | MIT OR Apache-2.0 | The CLAP test plugins only, which are not part of refrain itself |
+| [vst3](https://github.com/coupler-rs/vst3-rs) | MIT OR Apache-2.0 | Bindings to the VST3 API, generated from the MIT-licensed VST3 SDK headers |
+| [libloading](https://github.com/nagisa/rust_libloading) | ISC | Loading VST3 modules |
 
 Their transitive dependencies are listed by `cargo tree` and are all under
 licenses in the allow list of `deny.toml`.

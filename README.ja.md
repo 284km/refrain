@@ -4,10 +4,9 @@ macOS と Windows で動く DAW です。Rust で書いています。
 
 [English](README.md)
 
-> 状態: ごく初期の段階です。CLAP のインストゥルメントを読み込み、MIDI 入力から鳴らせます。
-> サステインペダルとピッチベンドも届きます。
-> 音はオーディオデバイスにも、デバイスを使わずに WAV ファイルにも出せます。
-> GUI はまだ無く、`refrain` コマンドだけです。
+> 状態: ごく初期の段階です。CLAP と VST3 のインストゥルメントを読み込み、MIDI 入力から
+> 鳴らせます。サステインペダルとピッチベンドも届きます。音はオーディオデバイスにも、
+> デバイスを使わずに WAV ファイルにも出せます。GUI はまだ無く、`refrain` コマンドだけです。
 
 ## 目標
 
@@ -19,13 +18,18 @@ macOS と Windows で動く DAW です。Rust で書いています。
 
 ```
 crates/
-  refrain-engine/      リアルタイムのエンジン。OS やデバイスのコードを持たない
-  refrain-clap/        CLAP プラグインをエンジンの中でホストする
-  refrain-test-synth/  ホスト機能のテストに使う小さな CLAP インストゥルメント
-  refrain/             `refrain` コマンド。オーディオデバイス、MIDI、WAV の出力
+  refrain-engine/           リアルタイムのエンジン。OS やデバイスのコードを持たない
+  refrain-clap/             CLAP プラグインをエンジンの中でホストする
+  refrain-vst3/             VST3 プラグインをエンジンの中でホストする
+  refrain-test-tone/        テスト用プラグインの音
+  refrain-test-synth/       ホスト機能のテストに使う CLAP のプラグイン
+  refrain-test-synth-vst3/  同じ音の VST3 のプラグイン
+  refrain/                  `refrain` コマンド。オーディオデバイス、MIDI、WAV の出力
+scripts/
+  build-test-plugins.sh     テスト用プラグインを .clap と .vst3 のファイルにする
 docs/
-  en/                  英語のドキュメント
-  ja/                  日本語のドキュメント
+  en/                       英語のドキュメント
+  ja/                       日本語のドキュメント
 ```
 
 エンジンは、デバイスのコールバックの中でも、デバイスを使わない書き出しでも同じように動きます。
@@ -39,25 +43,24 @@ CI のマシンにはサウンドカードが無いので、CI では書き出�
 ```sh
 cargo run -- devices                       # オーディオ出力デバイスの一覧
 cargo run -- midi                          # MIDI 入力の一覧
-cargo run -- plugins                       # インストールされた CLAP プラグインの一覧
+cargo run -- plugins                       # インストールされた CLAP と VST3 のプラグインの一覧
 cargo run -- sine --freq 440 --seconds 2   # サイン波を鳴らす
 cargo test
 ```
 
-CLAP のインストゥルメントを聞くには、テスト用シンセをビルドして鳴らします。MIDI キーボードが
+インストゥルメントを聞くには、テスト用プラグインをビルドして鳴らします。MIDI キーボードが
 つながっていればキーボードから弾けます。つながっていなければ、`--demo` で短いフレーズが鳴ります。
 
 ```sh
-cargo build -p refrain-test-synth
-cargo run -- play target/debug/librefrain_test_synth.dylib           # MIDI キーボードから
-cargo run -- play target/debug/librefrain_test_synth.dylib --demo    # 短いフレーズ
-cargo run -- render out.wav --plugin target/debug/librefrain_test_synth.dylib
+scripts/build-test-plugins.sh
+cargo run -- play target/test-plugins/refrain-test-synth.clap          # MIDI キーボードから
+cargo run -- play target/test-plugins/refrain-test-synth.vst3 --demo   # 短いフレーズ
+cargo run -- render out.wav --plugin target/test-plugins/refrain-test-synth.vst3
 ```
 
-Windows ではファイルが `target\debug\refrain_test_synth.dll` になります。
-
-インストール済みのインストゥルメントも同じように、`.clap` ファイルを渡せば使えます。
-プラグインを読み込むと、そのコードが refrain の中で動きます。
+インストール済みのインストゥルメントも同じように、`.clap` か `.vst3` のファイル（またはバンドル）を
+渡せば使えます。1 つのファイルに複数のプラグインがあるときは `--id` で選びます（VST3 は名前か
+クラス ID）。プラグインを読み込むと、そのコードが refrain の中で動きます。
 
 ## ドキュメント
 

@@ -5,6 +5,7 @@
 
 mod audio;
 mod midi;
+mod plugin;
 
 use std::error::Error;
 use std::io::BufRead;
@@ -15,11 +16,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait};
-use refrain_clap::{ClapError, PluginEntry};
-use refrain_clap::{ClapPlugin, find_clap_files, load_entry, plugins_in, standard_paths};
-use refrain_engine::{Event, SUSTAIN, Sine, TimedEvent, render_offline};
+use refrain_engine::{Event, Processor, SUSTAIN, Sine, TimedEvent, render_offline};
 
 use audio::Output;
+use plugin::Plugin;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -27,17 +27,17 @@ const USAGE: &str = "\
 usage:
   refrain devices                       list audio output devices
   refrain midi                          list MIDI inputs
-  refrain plugins                       list installed CLAP plugins
+  refrain plugins                       list installed CLAP and VST3 plugins
   refrain sine [options]                play a sine wave
-  refrain play <plugin.clap> [options]  play a CLAP instrument from a MIDI input
+  refrain play <plugin> [options]       play a .clap or .vst3 instrument from MIDI
   refrain render <out.wav> [options]    write a sine wave, or a plugin playing
                                         a short phrase with --plugin, to a WAV file
 
 options:
   --device <id>      audio output, as `refrain devices` prints it
   --midi <n|name>    MIDI input: its number in `refrain midi`, or part of its name
-  --id <plugin id>   which plugin, when a CLAP file holds several
-  --plugin <path>    render through this CLAP plugin
+  --id <id|name>     which plugin, when a file holds several (VST3: name or class ID)
+  --plugin <path>    render through this .clap or .vst3 plugin
   --demo             play the short phrase instead of reading MIDI (play)
   --seconds <s>      length (default 2; play runs until Enter without it)
   --freq <hz>        sine frequency (default 440)
@@ -188,22 +188,6 @@ fn demo_phrase() -> Vec<(f64, Event)> {
     phrase
 }
 
-/// Instantiates a plugin from `entry`. Without an id, a file that holds
-/// several plugins gives its first one, and says so.
-fn open_plugin(entry: &PluginEntry, id: Option<&str>) -> Result<ClapPlugin> {
-    match ClapPlugin::new(entry, id) {
-        Err(ClapError::Ambiguous(ids)) => {
-            println!(
-                "this file holds {} plugins; using the first. Choose with --id: {}",
-                ids.len(),
-                ids.join(", ")
-            );
-            Ok(ClapPlugin::new(entry, Some(&ids[0]))?)
-        }
-        other => Ok(other?),
-    }
-}
-
 fn devices() -> Result<()> {
     let host = cpal::default_host();
     println!("host: {}", host.id().name());
@@ -244,23 +228,7 @@ fn list_midi() -> Result<()> {
 }
 
 fn list_plugins() -> Result<()> {
-    let dirs = standard_paths();
-    for dir in &dirs {
-        println!("searching {}", dir.display());
-    }
-    let files = find_clap_files(&dirs);
-    if files.is_empty() {
-        println!("no CLAP plugins found");
-    }
-    for file in files {
-        println!("{}", file.display());
-        // SAFETY: the user installed these plugins; listing them means
-        // running their code, as every host does.
-        match unsafe { load_entry(&file) }.and_then(|e| plugins_in(&e)) {
-            Ok(plugins) => plugins.iter().for_each(|p| println!("    {p}")),
-            Err(e) => println!("    {e}"),
-        }
-    }
+    plugin::list_installed();
     Ok(())
 }
 
@@ -274,11 +242,10 @@ fn sine(o: &Options) -> Result<()> {
 
 fn play(path: &str, o: &Options) -> Result<()> {
     // SAFETY: the user asked for this file to be loaded.
-    let entry = unsafe { load_entry(Path::new(path)) }?;
-    let mut plugin = open_plugin(&entry, o.id.as_deref())?;
+    let mut plugin = unsafe { Plugin::open(Path::new(path), o.id.as_deref()) }?;
     let output = Output::open(o.device.as_deref())?;
     let processor = plugin.activate(output.sample_rate(), refrain_engine::MAX_BLOCK_FRAMES)?;
-    println!("{}", plugin.info());
+    println!("{}", plugin.describe());
     println!("output: {}", output.describe());
 
     // Events reach the audio thread through this queue, from the MIDI thread
@@ -354,9 +321,8 @@ fn render(path: &str, o: &Options) -> Result<()> {
         ),
         Some(plugin_path) => {
             // SAFETY: the user asked for this file to be loaded.
-            let entry = unsafe { load_entry(Path::new(plugin_path)) }?;
-            let mut plugin = open_plugin(&entry, o.id.as_deref())?;
-            println!("{}", plugin.info());
+            let mut plugin = unsafe { Plugin::open(Path::new(plugin_path), o.id.as_deref()) }?;
+            println!("{}", plugin.describe());
             let mut processor = plugin.activate(rate, block)?;
             let events: Vec<TimedEvent> = demo_phrase()
                 .into_iter()

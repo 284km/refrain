@@ -6,10 +6,10 @@ heard or checked on both macOS and Windows.
 | # | Step | State |
 |---|---|---|
 | 1 | Play a sine wave on a device, and render it offline | Done |
-| 2 | Load a CLAP or VST3 instrument and play it from a MIDI keyboard | Done for CLAP. Checked on a macOS device and through a virtual MIDI port; not yet with a hardware keyboard or on a Windows device |
+| 2 | Load a CLAP or VST3 instrument and play it from a MIDI keyboard | Done. Checked on a macOS device and through a virtual MIDI port; not yet with a hardware keyboard or on a Windows device |
 | 2a | Sustain pedal, pitch bend and other controllers | Done. Plugins that take notes only get the pedal played for them |
-| 2b | VST3 instruments | Next |
-| 3 | Open a plugin's editor in a window | |
+| 2b | VST3 instruments | Done. Test plugins agree with the CLAP ones sample for sample; a commercial VST3 instrument loads, renders and plays on a macOS device |
+| 3 | Open a plugin's editor in a window | Next |
 | 4 | Save and restore plugin state with a project | |
 | 5 | Record and play back MIDI clips on a timeline | |
 | 6 | Effect chains and a mixer | |

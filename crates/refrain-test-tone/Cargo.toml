@@ -1,0 +1,10 @@
+[package]
+name = "refrain-test-tone"
+description = "The sound of refrain's test plugins, shared by the CLAP and VST3 versions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]

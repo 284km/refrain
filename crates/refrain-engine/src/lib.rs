@@ -33,6 +33,26 @@ pub trait Processor: Send {
     /// Fills `out`, which holds interleaved frames of `channels` samples each.
     /// `events` belong to this block and are in order of frame.
     fn process(&mut self, out: &mut [f32], channels: usize, events: &[TimedEvent]);
+
+    /// Whether the processor has failed and gives silence from now on, as a
+    /// plugin does after an error.
+    fn has_failed(&self) -> bool {
+        false
+    }
+}
+
+impl<P: Processor + ?Sized> Processor for Box<P> {
+    fn prepare(&mut self, sample_rate: f32, max_block_frames: usize) {
+        (**self).prepare(sample_rate, max_block_frames);
+    }
+
+    fn process(&mut self, out: &mut [f32], channels: usize, events: &[TimedEvent]) {
+        (**self).process(out, channels, events);
+    }
+
+    fn has_failed(&self) -> bool {
+        (**self).has_failed()
+    }
 }
 
 /// A sine oscillator, written to every channel. It ignores events.
@@ -68,6 +88,36 @@ impl Processor for Sine {
             frame.fill(value);
             self.phase += step;
             self.phase -= self.phase.floor();
+        }
+    }
+}
+
+/// Writes a plugin's output into an interleaved device buffer.
+///
+/// `planar` holds `plugin_channels` channels one after another, each
+/// `stride` samples long; the first `out.len() / channels` samples of each are
+/// used. A mono plugin goes to every channel, a plugin with more channels is
+/// mixed down for a mono device, and device channels the plugin does not
+/// have stay silent.
+pub fn interleave(
+    planar: &[f32],
+    plugin_channels: usize,
+    stride: usize,
+    out: &mut [f32],
+    channels: usize,
+) {
+    for (i, frame) in out.chunks_exact_mut(channels).enumerate() {
+        if channels == 1 && plugin_channels > 1 {
+            let sum: f32 = (0..plugin_channels).map(|c| planar[c * stride + i]).sum();
+            frame[0] = sum / plugin_channels as f32;
+            continue;
+        }
+        for (c, sample) in frame.iter_mut().enumerate() {
+            *sample = match plugin_channels {
+                1 => planar[i],
+                n if c < n => planar[c * stride + i],
+                _ => 0.0,
+            };
         }
     }
 }

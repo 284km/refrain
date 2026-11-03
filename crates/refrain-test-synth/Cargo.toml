@@ -1,6 +1,6 @@
 [package]
 name = "refrain-test-synth"
-description = "A small, deterministic CLAP instrument that refrain uses to test plugin hosting."
+description = "The CLAP test plugins refrain uses to test plugin hosting."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,5 +12,6 @@ publish.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+refrain-test-tone = { path = "../refrain-test-tone" }
 clack-plugin = "0.2"
 clack-extensions = { version = "0.2", features = ["clack-plugin", "audio-ports", "note-ports"] }

@@ -25,21 +25,22 @@ jobs:
       - run: cargo test
       # CI has no sound card, so the engine is exercised through the offline path.
       - run: cargo run -- render target/ci.wav --seconds 1
-      # Load the test synth from its file, the way a real plugin is loaded.
-      - name: Render through the test synth
+      # Load the test plugins from their files, packaged the way plugins are
+      # installed: bundles on macOS, single files on Windows.
+      - name: Render through the test plugins
         shell: bash
         run: |
-          cargo build -p refrain-test-synth
-          case "$RUNNER_OS" in
-            macOS) plugin=target/debug/librefrain_test_synth.dylib ;;
-            Windows) plugin=target/debug/refrain_test_synth.dll ;;
-          esac
-          cargo run -- render target/synth.wav --plugin "$plugin" | tee target/render.log
+          scripts/build-test-plugins.sh
+          p=target/test-plugins
+          cargo run -- render target/clap.wav --plugin $p/refrain-test-synth.clap | tee target/render.log
           grep -Eq "peak 0\.[1-9]" target/render.log
-          # The notes-only plugin relies on refrain to play the sustain pedal.
-          # It has to sound exactly like the plugin that plays it itself.
-          cargo run -- render target/notes-only.wav --plugin "$plugin" --id dev.refrain.test-synth.notes-only
-          cmp target/synth.wav target/notes-only.wav
+          # The notes-only plugins rely on refrain to play the sustain pedal,
+          # and VST3 plugins take controllers as parameters. All four have to
+          # sound exactly the same.
+          cargo run -- render target/clap-notes.wav --plugin $p/refrain-test-synth.clap --id dev.refrain.test-synth.notes-only
+          cargo run -- render target/vst3.wav --plugin $p/refrain-test-synth.vst3
+          cargo run -- render target/vst3-notes.wav --plugin $p/refrain-test-synth.vst3 --id "refrain test synth (notes only)"
+          for f in clap-notes vst3 vst3-notes; do cmp target/clap.wav target/$f.wav; done
 
   licenses:
     runs-on: ubuntu-latest

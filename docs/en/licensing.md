@@ -31,7 +31,7 @@ commit that does it.
 
 ## Plugin formats
 
-- **VST3**: the SDK is MIT-licensed since version 3.8. refrain will use the
+- **VST3**: the SDK is MIT-licensed since version 3.8. refrain uses the
   [`vst3`](https://github.com/coupler-rs/vst3-rs) crate (MIT OR Apache-2.0),
   whose bindings are generated from it.
 - **CLAP**: MIT. refrain uses [`clack`](https://github.com/prokopyl/clack)
