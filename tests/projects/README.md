@@ -14,7 +14,13 @@ scripts/build-test-plugins.sh
   `refrain record --demo`. CI renders them and checks they sound exactly like
   `refrain render --plugin <test plugin>`, which sends the same phrase as
   events.
+- `mix-*.refrain` hold two tracks playing the phrase: the second through the
+  test effect, 6 dB down and panned left, and the master through the test
+  effect too. They were put together with `refrain new`, `track add`,
+  `fx add` and `mix`. CI puts the same project together again, and checks it
+  sounds exactly like these, in both formats.
 
 ```sh
 cargo run -- render phrase.wav --plugin tests/projects/phrase-vst3.refrain
+cargo run -- show tests/projects/mix-vst3.refrain
 ```

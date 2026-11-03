@@ -1,35 +1,56 @@
 //! refrain's project files.
 //!
-//! A project names an instrument plugin and holds its state, so opening the
-//! project brings the sound back, and holds the clips played on it. It is
+//! A project holds tracks. Each track has an instrument plugin, a chain of
+//! effect plugins after it, how it goes into the mix, and the clips played on
+//! it. The mixed tracks go through the master's effects. Every plugin is
+//! named with its state, so opening the project brings the sound back. It is
 //! JSON, so it can be read and diffed:
 //!
 //! ```json
 //! {
-//!   "refrain": 2,
+//!   "refrain": 3,
 //!   "tempo": 120.0,
 //!   "ticks_per_beat": 960,
-//!   "instrument": {
-//!     "format": "vst3",
-//!     "path": "plugins/Synth.vst3",
-//!     "id": "7E5C0A312B9D4F1A9C3E6D521F0A8B44",
-//!     "name": "Synth",
-//!     "state": { "data": "cnRzMQAAAD8=", "controller": "" }
-//!   },
-//!   "clips": [
-//!     { "start": 0, "events": [[0, [144, 60, 100]], [480, [128, 60, 64]]] }
-//!   ]
+//!   "tracks": [
+//!     {
+//!       "name": "Synth",
+//!       "instrument": {
+//!         "format": "vst3",
+//!         "path": "plugins/Synth.vst3",
+//!         "id": "7E5C0A312B9D4F1A9C3E6D521F0A8B44",
+//!         "name": "Synth",
+//!         "state": { "data": "cnRzMQAAAD8=", "controller": "" }
+//!       },
+//!       "effects": [
+//!         {
+//!           "format": "clap",
+//!           "path": "plugins/Delay.clap",
+//!           "id": "com.example.delay",
+//!           "name": "Delay",
+//!           "state": { "data": "", "controller": "" }
+//!         }
+//!       ],
+//!       "mix": { "volume_db": -6.0, "pan": 0.25, "mute": false, "solo": false },
+//!       "clips": [
+//!         { "start": 0, "events": [[0, [144, 60, 100]], [480, [128, 60, 64]]] }
+//!       ]
+//!     }
+//!   ],
+//!   "master": { "effects": [], "volume_db": 0.0 }
 //! }
 //! ```
 //!
 //! A clip starts at a tick of the timeline, and its events are at ticks from
-//! the clip's start, each a MIDI 1.0 message. Version 1 projects had no tempo
-//! and no clips; they read as 120 beats per minute with no clips.
+//! the clip's start, each a MIDI 1.0 message. `effects`, `mix`, `clips` and
+//! `master` may be left out. Versions 1 and 2 held one instrument and its
+//! clips; they read as a project with that one track. Version 1 had no tempo
+//! and no clips; it reads as 120 beats per minute with no clips.
 //!
 //! States are base64. `data` is a CLAP plugin's state or a VST3 component's;
-//! `controller` is a VST3 controller's, and empty for CLAP. A relative `path`
-//! is relative to the project file's folder, so a project can be moved
-//! together with the plugins next to it.
+//! `controller` is a VST3 controller's, and empty for CLAP. An empty `data`
+//! means the plugin starts as it would on its own. A relative `path` is
+//! relative to the project file's folder, so a project can be moved together
+//! with the plugins next to it.
 
 use std::error::Error;
 use std::fmt;
@@ -44,20 +65,70 @@ use serde::{Deserialize, Serialize};
 pub const EXTENSION: &str = "refrain";
 
 /// The version of the format this crate writes. It reads this and older ones.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
+
+/// The quietest and loudest volumes a project may hold, in decibels.
+pub const MIN_VOLUME_DB: f32 = -120.0;
+pub const MAX_VOLUME_DB: f32 = 24.0;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "Stored")]
 pub struct Project {
     /// The format version.
     pub refrain: u32,
     /// Beats per minute.
-    #[serde(default = "default_tempo")]
     pub tempo: f64,
-    #[serde(default = "default_ticks_per_beat")]
     pub ticks_per_beat: u64,
-    pub instrument: Instrument,
+    pub tracks: Vec<Track>,
+    pub master: Master,
+}
+
+/// A project as stored, in any version this crate reads.
+#[derive(Deserialize)]
+struct Stored {
+    refrain: u32,
+    #[serde(default = "default_tempo")]
+    tempo: f64,
+    #[serde(default = "default_ticks_per_beat")]
+    ticks_per_beat: u64,
     #[serde(default)]
-    pub clips: Vec<Clip>,
+    tracks: Vec<Track>,
+    #[serde(default)]
+    master: Master,
+    // Versions 1 and 2: one instrument, and the clips played on it.
+    instrument: Option<Plugin>,
+    #[serde(default)]
+    clips: Vec<Clip>,
+}
+
+impl TryFrom<Stored> for Project {
+    type Error = String;
+
+    fn try_from(stored: Stored) -> Result<Self, String> {
+        let mut tracks = stored.tracks;
+        match (stored.refrain, stored.instrument) {
+            (0..=2, Some(instrument)) if tracks.is_empty() => {
+                let mut track = Track::new(instrument);
+                track.clips = stored.clips;
+                tracks.push(track);
+            }
+            (0..=2, _) => return Err("a version 1 or 2 project names one instrument".into()),
+            (_, None) if stored.clips.is_empty() => {}
+            _ => {
+                return Err(format!(
+                    "a version {} project keeps instruments and clips in tracks",
+                    stored.refrain
+                ));
+            }
+        }
+        Ok(Self {
+            refrain: stored.refrain,
+            tempo: stored.tempo,
+            ticks_per_beat: stored.ticks_per_beat,
+            tracks,
+            master: stored.master,
+        })
+    }
 }
 
 fn default_tempo() -> f64 {
@@ -68,7 +139,94 @@ fn default_ticks_per_beat() -> u64 {
     TICKS_PER_BEAT
 }
 
-/// Events played on the instrument, from a tick of the timeline.
+/// An instrument, the effects after it, how it is mixed, and what is played
+/// on it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Track {
+    /// For people: the instrument's name, unless someone changes it.
+    pub name: String,
+    pub instrument: Plugin,
+    /// In order: each takes what the one before gives.
+    #[serde(default)]
+    pub effects: Vec<Plugin>,
+    #[serde(default)]
+    pub mix: Mix,
+    #[serde(default)]
+    pub clips: Vec<Clip>,
+}
+
+impl Track {
+    /// A track with `instrument`, named after it, and nothing else.
+    pub fn new(instrument: Plugin) -> Self {
+        Self {
+            name: instrument.name.clone(),
+            instrument,
+            effects: Vec::new(),
+            mix: Mix::default(),
+            clips: Vec::new(),
+        }
+    }
+
+    /// Every clip's events at ticks of the timeline, in order.
+    pub fn sequence(&self) -> Vec<(u64, Event)> {
+        let mut events: Vec<(u64, Event)> = self
+            .clips
+            .iter()
+            .flat_map(|clip| {
+                clip.events.iter().filter_map(move |(tick, midi)| {
+                    Some((clip.start + tick, Event::from_midi(midi)?))
+                })
+            })
+            .collect();
+        events.sort_by_key(|e| e.0);
+        events
+    }
+
+    /// Adds a clip at `start`, holding `events` at ticks from the start.
+    pub fn add_clip(&mut self, start: u64, events: &[(u64, Event)]) {
+        let mut events: Vec<(u64, Vec<u8>)> = events
+            .iter()
+            .map(|(tick, event)| (*tick, midi_bytes(event)))
+            .collect();
+        events.sort_by_key(|e| e.0);
+        self.clips.push(Clip { start, events });
+    }
+}
+
+/// How a track goes into the mix.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Mix {
+    /// Volume in decibels; 0 leaves the track as it is.
+    pub volume_db: f32,
+    /// Balance from left (-1) to right (1).
+    pub pan: f32,
+    pub mute: bool,
+    /// When any track is soloed, only soloed tracks are heard.
+    pub solo: bool,
+}
+
+impl Mix {
+    pub fn to_engine(self) -> refrain_engine::Mix {
+        refrain_engine::Mix {
+            volume_db: self.volume_db,
+            pan: self.pan,
+            mute: self.mute,
+            solo: self.solo,
+        }
+    }
+}
+
+/// The effects every track goes through once mixed, and the volume after
+/// them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Master {
+    pub effects: Vec<Plugin>,
+    pub volume_db: f32,
+}
+
+/// Events played on an instrument, from a tick of the timeline.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     /// The tick of the timeline the clip starts at.
@@ -84,8 +242,9 @@ pub enum Format {
     Vst3,
 }
 
+/// A plugin, where to find it, and its state.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Instrument {
+pub struct Plugin {
     pub format: Format,
     /// Where the plugin file is, as stored: `/` separates folders on every
     /// platform, and a relative path is relative to the project's folder.
@@ -95,6 +254,37 @@ pub struct Instrument {
     /// The plugin's name, for people reading the file.
     pub name: String,
     pub state: State,
+}
+
+impl Plugin {
+    /// The plugin at `plugin` (relative to the current folder, or absolute),
+    /// for a project to be written to `file`.
+    pub fn new(
+        file: &Path,
+        format: Format,
+        plugin: &Path,
+        id: String,
+        name: String,
+        state: State,
+    ) -> Self {
+        Self {
+            format,
+            path: store_path(plugin, file),
+            id,
+            name,
+            state,
+        }
+    }
+
+    /// Where the plugin file is, for a project read from `file`.
+    pub fn file(&self, file: &Path) -> PathBuf {
+        let stored = PathBuf::from(&self.path);
+        if stored.is_absolute() {
+            stored
+        } else {
+            fold_parents(&folder_of(file).join(stored))
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -144,107 +334,126 @@ impl fmt::Display for ProjectError {
 
 impl Error for ProjectError {}
 
-impl Project {
-    /// A project for the plugin at `plugin` (relative to the current folder,
-    /// or absolute), to be written to `file`.
-    pub fn new(
-        file: &Path,
-        format: Format,
-        plugin: &Path,
-        id: String,
-        name: String,
-        state: State,
-    ) -> Self {
+impl Default for Project {
+    fn default() -> Self {
         Self {
             refrain: VERSION,
             tempo: default_tempo(),
             ticks_per_beat: TICKS_PER_BEAT,
-            instrument: Instrument {
-                format,
-                path: store_path(plugin, file),
-                id,
-                name,
-                state,
-            },
-            clips: Vec::new(),
+            tracks: Vec::new(),
+            master: Master::default(),
         }
     }
+}
 
-    /// Points the project at the plugin at `plugin`, as seen from the current
-    /// folder, for a project to be written to `file`; and gives it `state`.
-    pub fn set_instrument(&mut self, file: &Path, plugin: &Path, state: State) {
-        self.instrument.path = store_path(plugin, file);
-        self.instrument.state = state;
+impl Project {
+    /// A project with one track, playing `instrument`.
+    pub fn with_instrument(instrument: Plugin) -> Self {
+        Self {
+            tracks: vec![Track::new(instrument)],
+            ..Self::default()
+        }
     }
 
     pub fn tempo(&self) -> Tempo {
         Tempo::new(self.tempo)
     }
 
-    /// Every clip's events at ticks of the timeline, in order.
-    pub fn sequence(&self) -> Vec<(u64, Event)> {
-        let mut events: Vec<(u64, Event)> = self
-            .clips
-            .iter()
-            .flat_map(|clip| {
-                clip.events.iter().filter_map(move |(tick, midi)| {
-                    Some((clip.start + tick, Event::from_midi(midi)?))
-                })
-            })
-            .collect();
-        events.sort_by_key(|e| e.0);
-        events
-    }
-
-    /// The tick just after the last event of any clip.
+    /// The tick just after the last event of any clip on any track.
     pub fn end(&self) -> u64 {
-        self.sequence().last().map_or(0, |e| e.0 + 1)
+        self.tracks
+            .iter()
+            .filter_map(|t| t.sequence().last().map(|e| e.0 + 1))
+            .max()
+            .unwrap_or(0)
     }
 
-    /// Adds a clip at `start`, holding `events` at ticks from the start.
-    pub fn add_clip(&mut self, start: u64, events: &[(u64, Event)]) {
-        let mut events: Vec<(u64, Vec<u8>)> = events
-            .iter()
-            .map(|(tick, event)| (*tick, midi_bytes(event)))
-            .collect();
-        events.sort_by_key(|e| e.0);
-        self.clips.push(Clip { start, events });
+    /// Every plugin: each track's instrument and effects, then the master's
+    /// effects.
+    pub fn plugins_mut(&mut self) -> impl Iterator<Item = &mut Plugin> {
+        self.tracks
+            .iter_mut()
+            .flat_map(|t| std::iter::once(&mut t.instrument).chain(&mut t.effects))
+            .chain(&mut self.master.effects)
+    }
+
+    /// Makes the project, read from `from`, ready to be written to `to`:
+    /// relative plugin paths are changed to lead to the same files from
+    /// there.
+    pub fn move_to(&mut self, from: &Path, to: &Path) {
+        for plugin in self.plugins_mut() {
+            let file = plugin.file(from);
+            plugin.path = store_path(&file, to);
+        }
     }
 
     pub fn read(file: &Path) -> Result<Self, ProjectError> {
         let text = std::fs::read_to_string(file).map_err(|e| ProjectError::Io(file.into(), e))?;
-        let project: Project =
-            serde_json::from_str(&text).map_err(|e| ProjectError::Parse(file.into(), e))?;
-        if project.refrain > VERSION {
-            return Err(ProjectError::Version(project.refrain));
+        let parse = |e| ProjectError::Parse(file.into(), e);
+        // A newer version may not parse as this one; say what it is.
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(parse)?;
+        if let Some(version) = value.get("refrain").and_then(serde_json::Value::as_u64)
+            && version > u64::from(VERSION)
+        {
+            return Err(ProjectError::Version(
+                version.try_into().unwrap_or(u32::MAX),
+            ));
         }
-        let invalid = |why: String| ProjectError::Invalid(file.into(), why);
-        if project.ticks_per_beat != TICKS_PER_BEAT {
-            return Err(invalid(format!("ticks_per_beat must be {TICKS_PER_BEAT}")));
-        }
-        if !(project.tempo.is_finite() && (1.0..=1_000.0).contains(&project.tempo)) {
-            return Err(invalid(format!(
-                "tempo {} is not between 1 and 1000",
-                project.tempo
-            )));
-        }
-        for (i, clip) in project.clips.iter().enumerate() {
-            if let Some((tick, midi)) = clip
-                .events
-                .iter()
-                .find(|(_, m)| Event::from_midi(m).is_none())
-            {
-                return Err(invalid(format!(
-                    "clip {i}: tick {tick}: {midi:?} is not a MIDI message refrain reads"
-                )));
-            }
-        }
+        let project: Project = serde_json::from_value(value).map_err(parse)?;
+        project
+            .check()
+            .map_err(|why| ProjectError::Invalid(file.into(), why))?;
         Ok(project)
     }
 
+    /// Why the project is not one refrain can play, if it is not.
+    fn check(&self) -> Result<(), String> {
+        if self.ticks_per_beat != TICKS_PER_BEAT {
+            return Err(format!("ticks_per_beat must be {TICKS_PER_BEAT}"));
+        }
+        if !(self.tempo.is_finite() && (1.0..=1_000.0).contains(&self.tempo)) {
+            return Err(format!("tempo {} is not between 1 and 1000", self.tempo));
+        }
+        let volume = |db: f32, what: &str| {
+            if (MIN_VOLUME_DB..=MAX_VOLUME_DB).contains(&db) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{what}: volume_db {db} is not between {MIN_VOLUME_DB} and {MAX_VOLUME_DB}"
+                ))
+            }
+        };
+        for (t, track) in self.tracks.iter().enumerate() {
+            let what = format!("track {}", t + 1);
+            volume(track.mix.volume_db, &what)?;
+            if !(-1.0..=1.0).contains(&track.mix.pan) {
+                return Err(format!(
+                    "{what}: pan {} is not between -1 and 1",
+                    track.mix.pan
+                ));
+            }
+            for (c, clip) in track.clips.iter().enumerate() {
+                if let Some((tick, midi)) = clip
+                    .events
+                    .iter()
+                    .find(|(_, m)| Event::from_midi(m).is_none())
+                {
+                    return Err(format!(
+                        "{what}, clip {}: tick {tick}: {midi:?} is not a MIDI message refrain reads",
+                        c + 1
+                    ));
+                }
+            }
+        }
+        volume(self.master.volume_db, "master")
+    }
+
     /// Writes the project to `file`, in the current version of the format,
-    /// replacing the file only once the new contents are complete.
+    /// replacing the file only once the new contents are complete. A project
+    /// that could not be read back is refused.
     pub fn write(&self, file: &Path) -> Result<(), ProjectError> {
+        self.check()
+            .map_err(|why| ProjectError::Invalid(file.into(), why))?;
         // A project read from an older version may have gained what that
         // version cannot hold; an older refrain must not read it as its own.
         let current = Project {
@@ -256,16 +465,6 @@ impl Project {
         let partial = file.with_extension("refrain-partial");
         std::fs::write(&partial, text).map_err(|e| ProjectError::Io(partial.clone(), e))?;
         std::fs::rename(&partial, file).map_err(|e| ProjectError::Io(file.into(), e))
-    }
-
-    /// Where the plugin file is, for a project read from `file`.
-    pub fn plugin_path(&self, file: &Path) -> PathBuf {
-        let stored = PathBuf::from(&self.instrument.path);
-        if stored.is_absolute() {
-            stored
-        } else {
-            fold_parents(&folder_of(file).join(stored))
-        }
     }
 }
 
@@ -361,33 +560,72 @@ fn relative_to(path: &Path, base: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    fn sample() -> Project {
-        Project {
-            refrain: VERSION,
-            tempo: 120.0,
-            ticks_per_beat: TICKS_PER_BEAT,
-            clips: vec![Clip {
-                start: 0,
-                events: vec![(0, vec![144, 60, 100]), (480, vec![128, 60, 64])],
-            }],
-            instrument: Instrument {
-                format: Format::Vst3,
-                path: "plugins/Synth.vst3".into(),
-                id: "7E5C0A312B9D4F1A9C3E6D521F0A8B44".into(),
-                name: "Synth".into(),
-                state: State {
-                    data: b"rts1\0\0\0\x3f".to_vec(),
-                    controller: Vec::new(),
-                },
+    fn synth() -> Plugin {
+        Plugin {
+            format: Format::Vst3,
+            path: "plugins/Synth.vst3".into(),
+            id: "7E5C0A312B9D4F1A9C3E6D521F0A8B44".into(),
+            name: "Synth".into(),
+            state: State {
+                data: b"rts1\0\0\0\x3f".to_vec(),
+                controller: Vec::new(),
             },
         }
     }
 
+    fn sample() -> Project {
+        let mut track = Track::new(synth());
+        track.effects.push(Plugin {
+            format: Format::Clap,
+            path: "plugins/Delay.clap".into(),
+            id: "com.example.delay".into(),
+            name: "Delay".into(),
+            state: State::default(),
+        });
+        track.mix = Mix {
+            volume_db: -6.0,
+            pan: 0.25,
+            mute: false,
+            solo: false,
+        };
+        track.clips.push(Clip {
+            start: 0,
+            events: vec![(0, vec![144, 60, 100]), (480, vec![128, 60, 64])],
+        });
+        Project {
+            tracks: vec![track],
+            ..Project::default()
+        }
+    }
+
+    /// A directory of its own for one test.
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("refrain-project-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn reads_what_the_documentation_shows() {
+        let doc = include_str!("lib.rs");
+        let json: String = doc
+            .lines()
+            .skip_while(|l| *l != "//! ```json")
+            .skip(1)
+            .take_while(|l| *l != "//! ```")
+            .map(|l| l.strip_prefix("//!").unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let project: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(project, sample());
+    }
+
+    #[test]
+    fn a_version_2_project_reads_as_one_track() {
         let text = r#"{
           "refrain": 2,
-          "tempo": 120.0,
+          "tempo": 100.0,
           "ticks_per_beat": 960,
           "instrument": {
             "format": "vst3",
@@ -401,7 +639,15 @@ mod tests {
           ]
         }"#;
         let project: Project = serde_json::from_str(text).unwrap();
-        assert_eq!(project, sample());
+        assert_eq!(project.tempo, 100.0);
+        assert_eq!(project.tracks.len(), 1);
+        let track = &project.tracks[0];
+        assert_eq!(track.instrument, synth());
+        assert_eq!(track.name, "Synth");
+        assert_eq!(track.clips, sample().tracks[0].clips);
+        assert!(track.effects.is_empty());
+        assert_eq!(track.mix, Mix::default());
+        assert_eq!(project.master, Master::default());
     }
 
     #[test]
@@ -410,20 +656,43 @@ mod tests {
             "id": "x", "name": "x", "state": {"data": ""}}}"#;
         let project: Project = serde_json::from_str(text).unwrap();
         assert_eq!(project.tempo, 120.0);
-        assert!(project.clips.is_empty());
+        assert!(project.tracks[0].clips.is_empty());
+        // A missing controller state reads as empty.
+        assert!(project.tracks[0].instrument.state.controller.is_empty());
+    }
+
+    #[test]
+    fn versions_and_their_shapes_must_match() {
+        let old_without_instrument = r#"{"refrain": 2}"#;
+        let new_with_instrument = r#"{"refrain": 3, "instrument": {"format": "clap",
+            "path": "a.clap", "id": "x", "name": "x", "state": {"data": ""}}}"#;
+        for text in [old_without_instrument, new_with_instrument] {
+            assert!(serde_json::from_str::<Project>(text).is_err(), "{text}");
+        }
+        // A project with no tracks is fine: it is silent.
+        let empty: Project = serde_json::from_str(r#"{"refrain": 3}"#).unwrap();
+        assert_eq!(empty, Project::default());
     }
 
     #[test]
     fn an_older_project_is_written_in_the_current_version() {
-        let dir = std::env::temp_dir().join(format!("refrain-project-o-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("old");
         let file = dir.join("old.refrain");
-        let old = Project {
-            refrain: 1,
-            ..sample()
-        };
-        old.write(&file).unwrap();
-        assert_eq!(Project::read(&file).unwrap().refrain, VERSION);
+        std::fs::write(
+            &file,
+            r#"{"refrain": 1, "instrument": {"format": "clap", "path": "a.clap",
+            "id": "x", "name": "x", "state": {"data": ""}}}"#,
+        )
+        .unwrap();
+        let project = Project::read(&file).unwrap();
+        project.write(&file).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("\"refrain\": 3"), "{text}");
+        assert!(
+            !text.contains("\"instrument\": {\n    \"format\""),
+            "{text}"
+        );
+        assert_eq!(Project::read(&file).unwrap().tracks, project.tracks);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -440,69 +709,84 @@ mod tests {
             key,
             velocity: 64.0 / 127.0,
         };
-        project.add_clip(240, &[(480, off(64)), (0, on(64))]);
+        let track = &mut project.tracks[0];
+        track.add_clip(240, &[(480, off(64)), (0, on(64))]);
         assert_eq!(
-            project.sequence(),
+            track.sequence(),
             [(0, on(60)), (240, on(64)), (480, off(60)), (720, off(64))]
         );
-        assert_eq!(project.end(), 721);
         // What a clip stores reads back as the same events.
-        assert_eq!(project.clips[1].events[0], (0, vec![0x90, 64, 100]));
+        assert_eq!(track.clips[1].events[0], (0, vec![0x90, 64, 100]));
+
+        // The end is the latest of any track's.
+        assert_eq!(project.end(), 721);
+        let mut later = Track::new(synth());
+        later.add_clip(960, &[(0, on(67))]);
+        project.tracks.push(later);
+        assert_eq!(project.end(), 961);
+        project.tracks.push(Track::new(synth()));
+        assert_eq!(project.end(), 961);
     }
 
     #[test]
-    fn refuses_clips_it_cannot_play() {
-        let dir = std::env::temp_dir().join(format!("refrain-project-c-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn refuses_what_it_cannot_play() {
+        let dir = scratch("bad");
         let file = dir.join("bad.refrain");
+        let mut broken = Vec::new();
         let mut project = sample();
-        project.clips[0].events.push((960, vec![0xc0, 5]));
-        project.write(&file).unwrap();
-        assert!(matches!(
-            Project::read(&file),
-            Err(ProjectError::Invalid(..))
-        ));
-        project = sample();
+        project.tracks[0].clips[0].events.push((960, vec![0xc0, 5]));
+        broken.push(project);
+        let mut project = sample();
         project.tempo = 0.0;
-        project.write(&file).unwrap();
-        assert!(matches!(
-            Project::read(&file),
-            Err(ProjectError::Invalid(..))
-        ));
+        broken.push(project);
+        let mut project = sample();
+        project.tracks[0].mix.pan = 1.5;
+        broken.push(project);
+        let mut project = sample();
+        project.tracks[0].mix.volume_db = -200.0;
+        broken.push(project);
+        let mut project = sample();
+        project.master.volume_db = 30.0;
+        broken.push(project);
+        for project in broken {
+            let err = project.write(&file).unwrap_err();
+            assert!(matches!(err, ProjectError::Invalid(..)), "{err}");
+            assert!(!file.exists());
+            // Written some other way, it is refused on reading.
+            std::fs::write(&file, serde_json::to_string(&project).unwrap()).unwrap();
+            let err = Project::read(&file).unwrap_err();
+            assert!(matches!(err, ProjectError::Invalid(..)), "{err}");
+            std::fs::remove_file(&file).unwrap();
+        }
+        // Infinity cannot be written at all.
+        let mut project = sample();
+        project.tracks[0].mix.volume_db = f32::INFINITY;
+        assert!(project.write(&file).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn writes_and_reads_back() {
-        let dir = std::env::temp_dir().join(format!("refrain-project-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("rw");
         let file = dir.join("song.refrain");
-        sample().write(&file).unwrap();
-        assert_eq!(Project::read(&file).unwrap(), sample());
+        let mut project = sample();
+        project.master.effects.push(synth());
+        project.master.volume_db = -3.0;
+        project.write(&file).unwrap();
+        assert_eq!(Project::read(&file).unwrap(), project);
         assert!(!file.with_extension("refrain-partial").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn a_missing_controller_state_reads_as_empty() {
-        let text = r#"{"refrain": 1, "instrument": {"format": "clap", "path": "a.clap",
-            "id": "x", "name": "x", "state": {"data": ""}}}"#;
-        let project: Project = serde_json::from_str(text).unwrap();
-        assert!(project.instrument.state.controller.is_empty());
-    }
-
-    #[test]
     fn refuses_newer_versions_and_bad_base64() {
-        let dir = std::env::temp_dir().join(format!("refrain-project-v-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("v");
         let file = dir.join("new.refrain");
-        // write() always writes the current version, so write this by hand.
-        let mut newer = sample();
-        newer.refrain = VERSION + 1;
-        std::fs::write(&file, serde_json::to_string(&newer).unwrap()).unwrap();
+        // A newer version is named as such, even if it no longer parses.
+        std::fs::write(&file, r#"{"refrain": 4, "tracks": "something new"}"#).unwrap();
         assert!(matches!(
             Project::read(&file),
-            Err(ProjectError::Version(_))
+            Err(ProjectError::Version(4))
         ));
         std::fs::write(
             &file,
@@ -523,14 +807,11 @@ mod tests {
             Path::new("songs/a.refrain"),
         );
         assert_eq!(stored, "../plugins/Synth.vst3");
-        let project = Project {
-            instrument: Instrument {
-                path: stored,
-                ..sample().instrument
-            },
-            ..sample()
+        let plugin = Plugin {
+            path: stored,
+            ..synth()
         };
-        let resolved = project.plugin_path(Path::new("songs/a.refrain"));
+        let resolved = plugin.file(Path::new("songs/a.refrain"));
         assert_eq!(resolved, Path::new("plugins/Synth.vst3"));
         assert_eq!(
             fold_parents(Path::new("../a/./b/../c")),
@@ -545,16 +826,26 @@ mod tests {
     }
 
     #[test]
-    fn absolute_plugin_paths_stay_absolute() {
-        let plugin = absolute(Path::new("Synth.vst3"));
-        let stored = store_path(&plugin, Path::new("songs/a.refrain"));
-        let project = Project {
-            instrument: Instrument {
-                path: stored,
-                ..sample().instrument
-            },
-            ..sample()
-        };
-        assert_eq!(project.plugin_path(Path::new("songs/a.refrain")), plugin);
+    fn moving_a_project_keeps_every_plugin_found() {
+        let mut project = sample();
+        project.master.effects.push(Plugin {
+            path: "Reverb.clap".into(),
+            ..synth()
+        });
+        let absolute_plugin = absolute(Path::new("Elsewhere.vst3"));
+        project.tracks[0].effects[0].path = store_path(&absolute_plugin, Path::new("x"));
+        let from = Path::new("songs/a.refrain");
+        let to = Path::new("backup/old/a.refrain");
+        let before: Vec<PathBuf> = project.plugins_mut().map(|p| p.file(from)).collect();
+        project.move_to(from, to);
+        let after: Vec<PathBuf> = project.plugins_mut().map(|p| p.file(to)).collect();
+        assert_eq!(after, before);
+        assert_eq!(
+            project.tracks[0].instrument.path,
+            "../../songs/plugins/Synth.vst3"
+        );
+        assert_eq!(project.master.effects[0].path, "../../songs/Reverb.clap");
+        // Absolute paths stay absolute.
+        assert_eq!(project.tracks[0].effects[0].file(to), absolute_plugin);
     }
 }

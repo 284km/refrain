@@ -34,7 +34,8 @@ use clack_host::prelude::*;
 /// A loaded CLAP file. Get one from [`load_entry`].
 pub use clack_host::entry::PluginEntry;
 use refrain_engine::{
-    Event, MAX_BLOCK_EVENTS, MAX_PEDAL_RELEASES, Processor, SustainPedal, TimedEvent, interleave,
+    Event, MAX_BLOCK_EVENTS, MAX_PEDAL_RELEASES, Processor, SustainPedal, TimedEvent, deinterleave,
+    interleave,
 };
 
 /// What a plugin says about itself.
@@ -507,7 +508,8 @@ impl ClapPlugin {
             }
             (channels, main)
         };
-        let (input_channels, _) = port_channels(true);
+        let (input_channels, main_input) = port_channels(true);
+        let main_input = main_input.or((!input_channels.is_empty()).then_some(0));
         let (output_channels, main_output) = port_channels(false);
         let main_output = match main_output {
             Some(i) => i,
@@ -546,6 +548,7 @@ impl ClapPlugin {
             ),
             inputs: alloc(&input_channels),
             outputs: alloc(&output_channels),
+            main_input,
             main_output,
             events: EventBuffer::with_capacity(MAX_EVENTS),
             note_port,
@@ -619,6 +622,9 @@ pub struct ClapProcessor {
     // `max_block_frames` long. Plugins read and write channels separately.
     inputs: Vec<Vec<f32>>,
     outputs: Vec<Vec<f32>>,
+    // An effect hears what comes before it on its main input. Other inputs,
+    // such as side chains, get silence.
+    main_input: Option<usize>,
     main_output: usize,
     events: EventBuffer,
     note_port: Option<NotePort>,
@@ -707,20 +713,29 @@ impl Processor for ClapProcessor {
         self.push_events(events);
 
         let max = self.max_block_frames;
+        let main_input = self.main_input;
+        for (p, port) in self.inputs.iter_mut().enumerate() {
+            if main_input == Some(p) {
+                let plugin_channels = port.len() / max;
+                deinterleave(out, channels, port, plugin_channels, max);
+            } else {
+                for channel in port.chunks_exact_mut(max) {
+                    channel[..frames].fill(0.0);
+                }
+            }
+        }
         let ins = self
             .input_ports
-            .with_input_buffers(self.inputs.iter_mut().map(|port| AudioPortBuffer {
-                latency: 0,
-                channels: AudioPortBufferType::f32_input_only(port.chunks_exact_mut(max).map(
-                    |channel| {
-                        let buffer = &mut channel[..frames];
-                        buffer.fill(0.0);
-                        InputChannel {
-                            buffer,
-                            is_constant: true,
-                        }
-                    },
-                )),
+            .with_input_buffers(self.inputs.iter_mut().enumerate().map(|(p, port)| {
+                AudioPortBuffer {
+                    latency: 0,
+                    channels: AudioPortBufferType::f32_input_only(port.chunks_exact_mut(max).map(
+                        move |channel| InputChannel {
+                            buffer: &mut channel[..frames],
+                            is_constant: main_input != Some(p),
+                        },
+                    )),
+                }
             }));
         let mut outs = self
             .output_ports

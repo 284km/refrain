@@ -12,6 +12,11 @@
 //!   play the sustain pedal for it.
 //!
 //! Both save their volume as their state.
+//!
+//! The file also holds an effect, [`EFFECT_ID`]: [`refrain_test_tone::effect`],
+//! the same as the VST3 test effect, which saves its gain as its state.
+
+mod effect;
 
 use std::cell::RefCell;
 use std::ffi::CStr;
@@ -41,6 +46,9 @@ pub const ID: &str = "dev.refrain.test-synth";
 
 /// The plugin that takes notes only.
 pub const NOTES_ONLY_ID: &str = "dev.refrain.test-synth.notes-only";
+
+/// The effect.
+pub const EFFECT_ID: &str = "dev.refrain.test-effect";
 
 use refrain_test_tone::Tone;
 pub use refrain_test_tone::{
@@ -87,7 +95,7 @@ pub struct Entry {
 
 impl clack_plugin::entry::Entry for Entry {
     fn new(_bundle_path: Option<&CStr>) -> Result<Self, EntryLoadError> {
-        use clack_plugin::plugin::features::{INSTRUMENT, STEREO, SYNTHESIZER};
+        use clack_plugin::plugin::features::{AUDIO_EFFECT, INSTRUMENT, STEREO, SYNTHESIZER};
         let describe = |id, name| {
             PluginDescriptor::new(id, name).with_features([INSTRUMENT, SYNTHESIZER, STEREO])
         };
@@ -95,6 +103,8 @@ impl clack_plugin::entry::Entry for Entry {
             factory: PluginFactoryWrapper::new(Factory {
                 full: describe(ID, "refrain test synth"),
                 notes_only: describe(NOTES_ONLY_ID, "refrain test synth (notes only)"),
+                effect: PluginDescriptor::new(EFFECT_ID, "refrain test effect")
+                    .with_features([AUDIO_EFFECT, STEREO]),
             }),
         })
     }
@@ -107,17 +117,19 @@ impl clack_plugin::entry::Entry for Entry {
 struct Factory {
     full: PluginDescriptor,
     notes_only: PluginDescriptor,
+    effect: PluginDescriptor,
 }
 
 impl PluginFactoryImpl for Factory {
     fn plugin_count(&self) -> u32 {
-        2
+        3
     }
 
     fn plugin_descriptor(&self, index: u32) -> Option<&PluginDescriptor> {
         match index {
             0 => Some(&self.full),
             1 => Some(&self.notes_only),
+            2 => Some(&self.effect),
             _ => None,
         }
     }
@@ -127,6 +139,14 @@ impl PluginFactoryImpl for Factory {
         host_info: HostInfo<'a>,
         plugin_id: &CStr,
     ) -> Option<PluginInstance<'a>> {
+        if Some(plugin_id) == self.effect.id() {
+            return Some(PluginInstance::new::<effect::TestEffect>(
+                host_info,
+                &self.effect,
+                |_host| Ok(effect::EffectShared::new()),
+                |_host, shared| Ok(effect::EffectMainThread { shared }),
+            ));
+        }
         let (descriptor, takes_midi) = if Some(plugin_id) == self.full.id() {
             (&self.full, true)
         } else if Some(plugin_id) == self.notes_only.id() {

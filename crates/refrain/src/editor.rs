@@ -10,7 +10,8 @@ use winit::raw_window_handle::HasWindowHandle;
 use winit::window::{Window, WindowId};
 
 use crate::Result;
-use crate::plugin::Plugin;
+use crate::plugin::Kind;
+use crate::session::{Session, Slot};
 
 /// Editor sizes are in points on macOS and in pixels elsewhere, in both
 /// plugin formats.
@@ -33,20 +34,23 @@ fn editor_size(size: PhysicalSize<u32>, scale: f64) -> (u32, u32) {
     }
 }
 
-/// Opens the plugin's editor in a window and runs until the window closes or
-/// `tick` returns false. `tick` runs every few milliseconds on the main
-/// thread.
+/// Opens the editor of the plugin in `slot` in a window, and runs until the
+/// window closes or `tick` returns false. `tick` runs every few milliseconds
+/// on the main thread.
 ///
 /// Returns `Ok(false)` straight away when the plugin has no editor that can be
 /// embedded.
 pub fn run(
-    plugin: &mut Plugin,
+    session: &mut Session,
+    slot: Slot,
     title: &str,
-    tick: &mut dyn FnMut(&mut Plugin) -> bool,
+    tick: &mut dyn FnMut(&mut Session) -> bool,
 ) -> Result<bool> {
+    session.plugin(slot)?;
     let event_loop = EventLoop::new()?;
     let mut app = App {
-        plugin,
+        session,
+        slot,
         title,
         tick,
         window: None,
@@ -55,7 +59,7 @@ pub fn run(
     };
     event_loop.run_app(&mut app)?;
     // The editor goes before the window it lives in.
-    app.plugin.close_editor();
+    app.plugin().close_editor();
     app.window.take();
     match app.error {
         Some(e) => Err(e),
@@ -64,15 +68,22 @@ pub fn run(
 }
 
 struct App<'a> {
-    plugin: &'a mut Plugin,
+    session: &'a mut Session,
+    slot: Slot,
     title: &'a str,
-    tick: &'a mut dyn FnMut(&mut Plugin) -> bool,
+    tick: &'a mut dyn FnMut(&mut Session) -> bool,
     window: Option<Window>,
     opened: Option<bool>,
     error: Option<Box<dyn std::error::Error>>,
 }
 
 impl App<'_> {
+    fn plugin(&mut self) -> &mut Kind {
+        self.session
+            .plugin(self.slot)
+            .expect("run checked the slot")
+    }
+
     fn open(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         let attributes = Window::default_attributes()
             .with_title(self.title)
@@ -83,7 +94,7 @@ impl App<'_> {
         let parent = window.window_handle()?.as_raw();
         // SAFETY: the window outlives the editor; `run` closes the editor
         // before dropping the window.
-        let size = unsafe { self.plugin.open_editor(parent, window.scale_factor()) }?;
+        let size = unsafe { self.plugin().open_editor(parent, window.scale_factor()) }?;
         match size {
             Some(size) => {
                 let resizable = if size.resizable { ", resizable" } else { "" };
@@ -113,7 +124,7 @@ impl App<'_> {
     }
 
     fn close(&mut self, event_loop: &ActiveEventLoop) {
-        self.plugin.close_editor();
+        self.plugin().close_editor();
         event_loop.exit();
     }
 }
@@ -132,12 +143,16 @@ impl ApplicationHandler for App<'_> {
         match event {
             WindowEvent::CloseRequested => self.close(event_loop),
             WindowEvent::Resized(size) => {
-                let Some(window) = &self.window else { return };
-                let (w, h) = editor_size(size, window.scale_factor());
-                let (aw, ah) = self.plugin.resize_editor(w, h);
+                let Some(scale) = self.window.as_ref().map(Window::scale_factor) else {
+                    return;
+                };
+                let (w, h) = editor_size(size, scale);
+                let (aw, ah) = self.plugin().resize_editor(w, h);
                 // Only push back when the editor insists on a clearly
                 // different size, so rounding cannot start a resize loop.
-                if aw.abs_diff(w) > 1 || ah.abs_diff(h) > 1 {
+                if (aw.abs_diff(w) > 1 || ah.abs_diff(h) > 1)
+                    && let Some(window) = &self.window
+                {
                     let _ = window.request_inner_size(window_size(aw, ah));
                 }
             }
@@ -149,12 +164,11 @@ impl ApplicationHandler for App<'_> {
         if self.window.is_none() {
             return;
         }
-        if let (Some(window), Some((w, h))) =
-            (&self.window, self.plugin.take_editor_resize_request())
-        {
+        let request = self.plugin().take_editor_resize_request();
+        if let (Some(window), Some((w, h))) = (&self.window, request) {
             let _ = window.request_inner_size(window_size(w, h));
         }
-        if self.plugin.editor_closed() || !(self.tick)(self.plugin) {
+        if self.plugin().editor_closed() || !(self.tick)(self.session) {
             self.close(event_loop);
             return;
         }

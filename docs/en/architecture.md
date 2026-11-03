@@ -33,7 +33,9 @@ The engine. It has no OS, device or file code, and no dependencies.
 
 - `Processor` is anything that fills an interleaved `f32` buffer:
   `prepare(sample_rate, max_block_frames)`, then
-  `process(out, channels, events)` again and again.
+  `process(out, channels, events)` again and again. On entry `out` holds the
+  processor's input, what came before it in a chain or else silence: an
+  instrument replaces it, an effect changes it.
 - Blocks are at most `MAX_BLOCK_FRAMES` (1024) frames and carry at most
   `MAX_BLOCK_EVENTS` (256) events, so buffers can be sized up front.
 - `Event` is what a player does: a note on or off, a controller such as the
@@ -47,6 +49,32 @@ The engine. It has no OS, device or file code, and no dependencies.
 - `render_offline` drives a `Processor` without a device, in blocks of a chosen
   size, the way a device would, and hands each block the events that fall in
   it.
+
+### Tracks and the mix
+
+A `Track` is a chain of processors, an instrument followed by its effects,
+and a `Mix`: a volume in decibels, a pan, mute and solo. A `Mixer` is a
+`Processor` that plays every track into a buffer of its own, adds them up,
+and runs the sum through the master's chain of effects and the master volume.
+
+- Each processor in a chain gets the buffer the one before it filled. The
+  order is the order in the project, and the test effect makes it audible.
+- Live events go to one track, the live track, and only to its instrument.
+  Effects get no events.
+- Pan turns one side down and leaves the other alone: at the centre a track
+  is exactly its volume, so a track with the default mix passes through bit
+  for bit. Only stereo has a pan; other channel counts take the volume only.
+- When any track is soloed, only soloed tracks are heard, and mute wins over
+  solo. A muted track is still played, so its instrument and clips stay in
+  time and it comes back in the right place.
+- Track buffers are allocated in `prepare`, for up to `MAX_CHANNELS` (32)
+  channels; with more, the mixer gives silence rather than allocate on the
+  audio thread.
+
+`deinterleave` is the other way round from `interleave`: it turns the
+interleaved signal into a plugin's channels for its input. A mono signal goes
+to every input channel, a mono plugin gets a mixdown, and input channels the
+signal lacks get silence.
 
 ### The timeline
 
@@ -82,7 +110,9 @@ Hosts CLAP plugins, using [`clack-host`](https://github.com/prokopyl/clack).
   understands. A plugin that takes MIDI gets notes as CLAP notes, when it
   takes those too, and everything else as MIDI, so it plays the pedal itself.
   A plugin that takes CLAP notes only gets notes, with `SustainPedal` playing
-  the pedal for it. The processor then interleaves the plugin's main output:
+  the pedal for it. An effect gets what comes before it in the chain on its
+  main audio input; other inputs, such as side chains, get silence. The
+  processor then interleaves the plugin's main output:
   a mono plugin goes to every channel, a stereo plugin on a mono device is
   mixed down, and extra device channels stay silent.
 - The audio stream has to stop before the `ClapPlugin` is dropped. If the
@@ -100,7 +130,9 @@ bindings.
   controller, connects them through their connection points, passes the
   component's state to the controller, and activates the main buses.
 - Activating gives a `Vst3Processor`, a `Processor` for the audio thread. It
-  calls `setProcessing` on its first block, on the audio thread.
+  calls `setProcessing` on its first block, on the audio thread. An effect
+  gets what comes before it in the chain on its first audio input; other
+  inputs get silence.
 - VST3 has no MIDI controller events. At activation the host reads the
   plugin's `IMidiMapping` for every channel and controller, pitch bend and
   channel pressure included. Mapped controllers are sent as parameter changes
@@ -141,12 +173,20 @@ restores them, on the main thread:
   When restoring, the controller is also given the component's state through
   `setComponentState`, so its parameters match.
 
-`refrain-project` writes a project as a small JSON file: the plugin's format,
-path and ID, and its state in base64. A relative plugin path is relative to
-the project's folder, and is rewritten when a project is saved somewhere else,
-so projects can move with the plugins next to them. A project is written to a
-temporary file first and renamed over the old one, so a failed save leaves the
-old project whole.
+`refrain-project` writes a project as a small JSON file. Version 3 holds
+tracks, each with an instrument, its effects, its mix and its clips, and a
+master with its effects and volume. Every plugin is named by its format, path
+and ID, with its state in base64; an empty state means the plugin starts as it
+would on its own. Versions 1 and 2 held one instrument and its clips, and read
+as a project with that one track.
+
+A relative plugin path is relative to the project's folder. When a project is
+saved somewhere else, or tracks are added from another project, every
+relative path is rewritten to lead to the same file from the new place, so
+projects can move with the plugins next to them. A project is checked before
+it is written, so refrain never writes one it would refuse to read (a volume
+of infinity, for one, has no JSON). It is written to a temporary file first
+and renamed over the old one, so a failed save leaves the old project whole.
 
 VST3 class IDs are stored the way the VST3 SDK prints them. Windows lays class
 IDs out in memory as COM GUIDs, with the first eight bytes in another order;
@@ -173,7 +213,14 @@ They save their volume, set from MIDI controller 7, as their state. The state
 format is the same in both formats, so a state saved through one host can be
 restored through the other: a test that both hosts pass the bytes intact.
 
-They have an editor too, from `refrain-test-editor`: a fixed 400 × 300 panel
+Each format also has an effect that multiplies by a gain, 2 to begin with,
+and clips at ±0.25, saving its gain as its state. Because it clips, two of
+them in a row give a different result in the other order, so a chain run in
+the wrong order fails a test; and so does an effect that is fed silence, or
+skipped. Tests run chains of effects in either format and in a mix of both,
+and require the same samples.
+
+The instruments have an editor too, from `refrain-test-editor`: a fixed 400 × 300 panel
 with the plugin's name, added as a child of the host's window. It checks that
 it really became a child, and fails otherwise, so a host that passes the wrong
 window cannot pass the editor check in CI.
@@ -192,6 +239,14 @@ The `refrain` command. It owns everything that touches the platform:
 - MIDI input, through `midir`, feeding the audio thread through an `rtrb`
   queue,
 - WAV files, through `hound`.
+
+A `Session` is a project with all its plugins loaded and their states given
+back. It builds the `Mixer` for playing or rendering, with each track's
+instrument wrapped in a `Sequencer` that plays the track's clips, and saves
+every plugin's state back into the project. A single plugin file opens as a
+project of one track. `new`, `show`, `track`, `fx` and `mix` change a project
+file without playing it; they load a plugin only to learn its format, ID and
+name.
 
 The device callback splits the device's buffer into blocks of at most
 `MAX_BLOCK_FRAMES`, runs the engine into an `f32` buffer and converts it to
@@ -214,6 +269,12 @@ the device's sample type.
   when the audio stream started, without the output latency, so a recording
   lands a few milliseconds late. There is no count-in yet, every clip starts at
   the start of the timeline, and the tempo is one tempo for the whole project.
+- **Effects add latency that is not made up for.** A plugin that reports
+  latency is not delayed against the others yet.
+- **The mix is fixed while playing.** Tracks, effects and the mix are set
+  before playing starts; changing them means starting again. There are no
+  sends, buses or groups, no automation, and effects get no MIDI and no side
+  chain.
 - **Projects are saved when the editor closes or `play` ends**, with `--save`.
   There is no saving while playing, and no autosave.
 - **A project whose plugin has moved** is not found by ID in the installed
@@ -244,7 +305,13 @@ device:
   of 64 as up. For VST3: not sending mapped controllers, dropping the sample
   offsets of notes or of parameter changes, normalizing pitch bend over 16384,
   and never reading the MIDI mapping, and dropping edits made in the editor.
-  Each one fails a test. For state: handing a CLAP plugin an empty state,
+  Each one fails a test. For effects and the mix: feeding an effect silence
+  instead of its input (in both hosts), running a chain backwards, swapping
+  the sides of the pan, and not passing a project's mix to the mixer. The pan
+  swap first passed the engine's tests, whose levels added up the same with
+  the sides swapped; the levels were changed so they no longer do. CI's mix
+  check caught it, and the mix not being passed on, from the peaks of each
+  channel. For state: handing a CLAP plugin an empty state,
   skipping a VST3 component's `setState`, and saving an empty VST3 state. For
   the timeline: playing sequenced events a frame late, dropping live events
   while a sequence plays, and leaving held notes in a finished recording. For

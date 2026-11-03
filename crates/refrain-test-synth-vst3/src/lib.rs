@@ -15,10 +15,16 @@
 //! Both save their volume as their state, in the same format as the CLAP
 //! plugins.
 //!
+//! The module also holds an effect, [`EFFECT_NAME`]:
+//! [`refrain_test_tone::effect`], the same as the CLAP test effect. It takes
+//! no events, has no parameters, and saves its gain as its state.
+//!
 //! VST3 has no MIDI controller events. Hosts read a plugin's `IMidiMapping`
 //! and send controllers as parameter changes instead.
 
 #![allow(non_snake_case)]
+
+mod effect;
 
 use std::cell::{Cell, RefCell};
 use std::ffi::{CString, c_char, c_void};
@@ -40,6 +46,9 @@ pub const NAME: &str = "refrain test synth";
 
 /// The instrument that takes notes only.
 pub const NOTES_ONLY_NAME: &str = "refrain test synth (notes only)";
+
+/// The effect.
+pub const EFFECT_NAME: &str = "refrain test effect";
 
 /// Parameters of the [`NAME`] instrument, and the MIDI controllers mapped to
 /// them on channel 1.
@@ -93,7 +102,7 @@ fn copy_cstring(src: &str, dst: &mut [c_char]) {
     }
 }
 
-fn copy_wstring(src: &str, dst: &mut [TChar]) {
+pub(crate) fn copy_wstring(src: &str, dst: &mut [TChar]) {
     let mut len = 0;
     for (s, d) in src.encode_utf16().zip(dst.iter_mut()) {
         *d = s as TChar;
@@ -106,11 +115,12 @@ fn copy_wstring(src: &str, dst: &mut [TChar]) {
     }
 }
 
-/// Which of the two instruments a class belongs to.
+/// Which of the plugins a class belongs to.
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Full,
     NotesOnly,
+    Effect,
 }
 
 impl Kind {
@@ -118,6 +128,7 @@ impl Kind {
         match self {
             Kind::Full => uid(0x7E5C0A31, 0x2B9D4F1A, 0x9C3E6D52, 0x1F0A8B44),
             Kind::NotesOnly => uid(0x7E5C0A32, 0x2B9D4F1A, 0x9C3E6D52, 0x1F0A8B44),
+            Kind::Effect => uid(0x7E5C0A33, 0x2B9D4F1A, 0x9C3E6D52, 0x1F0A8B44),
         }
     }
 
@@ -125,6 +136,7 @@ impl Kind {
         match self {
             Kind::Full => uid(0x3D81F6C1, 0x6A2E4B7F, 0x8E05C4A9, 0x52D71E30),
             Kind::NotesOnly => uid(0x3D81F6C2, 0x6A2E4B7F, 0x8E05C4A9, 0x52D71E30),
+            Kind::Effect => uid(0x3D81F6C3, 0x6A2E4B7F, 0x8E05C4A9, 0x52D71E30),
         }
     }
 
@@ -132,6 +144,14 @@ impl Kind {
         match self {
             Kind::Full => NAME,
             Kind::NotesOnly => NOTES_ONLY_NAME,
+            Kind::Effect => EFFECT_NAME,
+        }
+    }
+
+    fn sub_categories(self) -> &'static str {
+        match self {
+            Kind::Full | Kind::NotesOnly => "Instrument|Synth",
+            Kind::Effect => "Fx",
         }
     }
 }
@@ -771,7 +791,7 @@ impl Class for Factory {
     type Interfaces = (IPluginFactory2,);
 }
 
-const KINDS: [Kind; 2] = [Kind::Full, Kind::NotesOnly];
+const KINDS: [Kind; 3] = [Kind::Full, Kind::NotesOnly, Kind::Effect];
 
 impl Factory {
     /// Classes come in pairs: a processor, then its controller.
@@ -824,7 +844,9 @@ impl IPluginFactoryTrait for Factory {
     ) -> tresult {
         let cid = unsafe { *(cid as *const TUID) };
         let instance = KINDS.iter().find_map(|&kind| {
-            if cid == kind.processor_cid() {
+            if cid == kind.processor_cid() && kind == Kind::Effect {
+                ComWrapper::new(effect::EffectProcessor::new()).to_com_ptr::<FUnknown>()
+            } else if cid == kind.processor_cid() {
                 ComWrapper::new(SynthProcessor::new(kind)).to_com_ptr::<FUnknown>()
             } else if cid == kind.controller_cid() {
                 ComWrapper::new(SynthController::new(kind)).to_com_ptr::<FUnknown>()
@@ -859,7 +881,7 @@ impl IPluginFactory2Trait for Factory {
         copy_cstring(kind.name(), &mut info.name);
         info.classFlags = 0;
         copy_cstring(
-            if processor { "Instrument|Synth" } else { "" },
+            if processor { kind.sub_categories() } else { "" },
             &mut info.subCategories,
         );
         copy_cstring("refrain", &mut info.vendor);

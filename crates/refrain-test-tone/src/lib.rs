@@ -48,6 +48,45 @@ pub fn load_state(state: &[u8]) -> Option<f32> {
     (magic == b"rts1" && (0.0..=1.0).contains(&volume)).then_some(volume)
 }
 
+/// The test effect: it multiplies its input by a gain, then clips it to
+/// [`CEILING`](effect::CEILING). Clipping makes the order of two effects
+/// audible, so a host that runs a chain in the wrong order shows up in tests,
+/// and so does one that feeds an effect silence or skips it.
+pub mod effect {
+    /// The gain a new instance starts with.
+    pub const DEFAULT_GAIN: f32 = 2.0;
+
+    /// The largest gain a state may hold.
+    pub const MAX_GAIN: f32 = 4.0;
+
+    /// Samples are clipped to plus or minus this.
+    pub const CEILING: f32 = 0.25;
+
+    /// Processes `samples` in place. Channels are processed alike, so the
+    /// right channel's relation to the left survives unclipped.
+    pub fn process(gain: f32, samples: &mut [f32]) {
+        for s in samples {
+            *s = (*s * gain).clamp(-CEILING, CEILING);
+        }
+    }
+
+    /// The effect's saved state: its gain. Eight bytes, `rtf1` and the gain as
+    /// a little-endian `f32`, the same in both plugin formats.
+    pub fn save_state(gain: f32) -> [u8; 8] {
+        let mut state = *b"rtf1\0\0\0\0";
+        state[4..].copy_from_slice(&gain.to_le_bytes());
+        state
+    }
+
+    /// Reads a state written by [`save_state`]. `None` if it is not one, or
+    /// the gain is out of range.
+    pub fn load_state(state: &[u8]) -> Option<f32> {
+        let (magic, gain) = state.split_first_chunk::<4>()?;
+        let gain = f32::from_le_bytes(*gain.first_chunk::<4>()?);
+        (magic == b"rtf1" && (0.0..=MAX_GAIN).contains(&gain)).then_some(gain)
+    }
+}
+
 const VOICES: usize = 16;
 
 /// The pitch of a MIDI key, with A4 (key 69) at 440 Hz.
@@ -249,5 +288,23 @@ mod tests {
             load_state(&[b'r', b't', b's', b'1', 0, 0, 0x80, 0x7f]),
             None
         ); // infinity
+    }
+
+    #[test]
+    fn the_effect_clips_after_the_gain_so_order_matters() {
+        let mut a = [0.2, -0.2, 0.1];
+        effect::process(2.0, &mut a);
+        assert_eq!(a, [0.25, -0.25, 0.2]);
+        // Halving then doubling gives the input back; doubling then halving
+        // does not, once clipped.
+        let (mut x, mut y) = ([0.2f32], [0.2f32]);
+        effect::process(0.5, &mut x);
+        effect::process(2.0, &mut x);
+        effect::process(2.0, &mut y);
+        effect::process(0.5, &mut y);
+        assert_eq!((x[0], y[0]), (0.2, 0.125));
+        assert_eq!(effect::load_state(&effect::save_state(0.5)), Some(0.5));
+        assert_eq!(effect::load_state(&save_state(0.5)), None);
+        assert_eq!(effect::load_state(&effect::save_state(5.0)), None);
     }
 }

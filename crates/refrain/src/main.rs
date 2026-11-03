@@ -7,6 +7,8 @@ mod audio;
 mod editor;
 mod midi;
 mod plugin;
+mod project;
+mod session;
 
 use std::error::Error;
 use std::io::BufRead;
@@ -20,7 +22,7 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use refrain_engine::{Event, Processor, Recording, SUSTAIN, Sequencer, Sine, render_offline};
 
 use audio::Output;
-use plugin::Plugin;
+use session::{Session, Slot};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -32,7 +34,8 @@ usage:
   refrain sine [options]                play a sine wave
   refrain play <plugin> [options]       play a .clap or .vst3 instrument from MIDI,
                                         with its editor open. A .refrain project
-                                        works too, here and below
+                                        works too, here and below, and plays all
+                                        its tracks; MIDI goes to one, --track
   refrain record <plugin> [options]     like play, and record what comes in from MIDI
                                         as a new clip; needs --save, or a project
   refrain editor <plugin> [options]     open a plugin's editor, without audio
@@ -40,16 +43,37 @@ usage:
                                         project's clips or else a short phrase, to
                                         a WAV file
 
+projects:
+  refrain new <project>                 make an empty project
+  refrain show <project>                list its tracks, effects and mix
+  refrain track add <project> <plugin>  add a track playing an instrument; from a
+                                        .refrain, add that project's tracks
+  refrain track remove <project> <n>    remove track n
+  refrain fx add <project> <plugin>     add an effect at the end of a track's chain
+                                        (--track) or the master's (--master)
+  refrain fx remove <project> <k>       remove effect k of a track or the master
+  refrain mix <project> [options]       set a track's or the master's mix:
+                                        --volume, --pan, --mute, --solo
+
 options:
   --device <id>      audio output, as `refrain devices` prints it
   --midi <n|name>    MIDI input: its number in `refrain midi`, or part of its name
   --id <id|name>     which plugin, when a file holds several (VST3: name or class ID)
-  --plugin <path>    render through this .clap or .vst3 plugin
+  --plugin <path>    render through this .clap or .vst3 plugin or .refrain project
+  --track <n>        which track, counted from 1 (default 1): MIDI and recording
+                     go to it, and its plugins' editors open
+  --fx <k>           open the editor of effect k of the track, or of the master
+  --master           the master instead of a track (fx, mix, and with --fx)
+  --name <name>      the new track's name (track add)
+  --volume <dB>      volume in decibels (mix)
+  --pan <-1..1>      balance from left to right (mix)
+  --mute, --unmute, --solo, --unsolo
+                     mute a track, or solo it (mix)
   --demo             play the short phrase instead of reading MIDI (play)
   --no-editor        do not open the plugin's editor (play)
-  --save <project>   when done, save the plugin, its state and its clips as a
-                     project (play, record, editor)
-  --tempo <bpm>      beats per minute (default: the project's, or 120)
+  --save <project>   when done, save the project with every plugin's state and
+                     the clips (play, record, editor)
+  --tempo <bpm>      beats per minute (default: the project's, or 120; new)
   --click            play a metronome (play; record plays one unless --no-click)
   --seconds <s>      length (default 2; play and editor run until closed without it)
   --freq <hz>        sine frequency (default 440)
@@ -61,45 +85,104 @@ Loading a plugin runs its code in this process.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let with_path = |f: fn(&str, &Options) -> Result<()>, what: &str| match args.get(1) {
-        Some(path) if !path.starts_with("--") => {
-            Options::parse(&args[2..]).and_then(|o| f(path, &o))
-        }
-        _ => Err(format!("{what} needs a path").into()),
-    };
-    let result = match args.first().map(String::as_str) {
-        Some("devices") => devices(),
-        Some("midi") => list_midi(),
-        Some("plugins") => list_plugins(),
-        Some("sine") => Options::parse(&args[1..]).and_then(|o| sine(&o)),
-        Some("play") => with_path(play, "play"),
-        Some("record") => with_path(record, "record"),
-        Some("editor") => with_path(editor_only, "editor"),
-        Some("render") => with_path(render, "render"),
-        Some("-h" | "--help" | "help") => {
-            println!("{USAGE}");
-            Ok(())
-        }
-        _ => Err("unknown command".into()),
-    };
+    let result = run(&args);
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+        Err(e) if e.is::<Usage>() => {
             eprintln!("refrain: {e}\n\n{USAGE}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("refrain: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
-struct Options {
+/// A command given wrongly. Only these errors come with the usage text.
+#[derive(Debug)]
+struct Usage(String);
+
+impl std::fmt::Display for Usage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for Usage {}
+
+fn usage(e: impl std::fmt::Display) -> Box<dyn Error> {
+    Box::new(Usage(e.to_string()))
+}
+
+/// Runs a command: its words and paths first, then its options.
+fn run(args: &[String]) -> Result<()> {
+    let options_start = args
+        .iter()
+        .position(|a| a.starts_with("--"))
+        .unwrap_or(args.len());
+    let (words, flags) = args.split_at(options_start);
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    if matches!(words.as_slice(), [] | ["help"]) && flags.iter().any(|f| f == "--help") {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    let o = Options::parse(flags).map_err(usage)?;
+    match words.as_slice() {
+        ["help"] | ["-h"] => {
+            println!("{USAGE}");
+            Ok(())
+        }
+        ["devices"] => devices(),
+        ["midi"] => list_midi(),
+        ["plugins"] => list_plugins(),
+        ["sine"] => sine(&o),
+        ["play", path] => play(path, &o),
+        ["record", path] => record(path, &o),
+        ["editor", path] => editor_only(path, &o),
+        ["render", path] => render(path, &o),
+        ["new", path] => project::new(Path::new(path), &o),
+        ["show", path] => project::show(Path::new(path)),
+        ["track", "add", path, plugin] => {
+            project::add_track(Path::new(path), Path::new(plugin), &o)
+        }
+        ["track", "remove", path, n] => project::remove_track(Path::new(path), n),
+        ["fx", "add", path, plugin] => project::add_effect(Path::new(path), Path::new(plugin), &o),
+        ["fx", "remove", path, k] => project::remove_effect(Path::new(path), k, &o),
+        ["mix", path] => project::mix(Path::new(path), &o),
+        [] => Err(usage("no command")),
+        [command, ..] => Err(usage(format!(
+            "`{command}` needs other arguments, or is not a command"
+        ))),
+    }
+}
+
+/// A number counted from 1, as a person gives it, as an index from 0.
+fn index_from_one(value: &str, what: &str) -> Result<usize> {
+    match value.parse::<usize>() {
+        Ok(n) if n >= 1 => Ok(n - 1),
+        _ => Err(format!("{what} is counted from 1; {value} is not one").into()),
+    }
+}
+
+pub(crate) struct Options {
     device: Option<String>,
     midi: Option<String>,
-    id: Option<String>,
+    pub(crate) id: Option<String>,
     plugin: Option<String>,
     save: Option<String>,
+    /// Counted from 0.
+    pub(crate) track: Option<usize>,
+    fx: Option<usize>,
+    pub(crate) master: bool,
+    pub(crate) name: Option<String>,
+    pub(crate) volume: Option<f32>,
+    pub(crate) pan: Option<f32>,
+    pub(crate) mute: Option<bool>,
+    pub(crate) solo: Option<bool>,
     demo: bool,
     no_editor: bool,
-    tempo: Option<f64>,
+    pub(crate) tempo: Option<f64>,
     click: bool,
     no_click: bool,
     seconds: Option<f64>,
@@ -117,6 +200,14 @@ impl Options {
             id: None,
             plugin: None,
             save: None,
+            track: None,
+            fx: None,
+            master: false,
+            name: None,
+            volume: None,
+            pan: None,
+            mute: None,
+            solo: None,
             demo: false,
             no_editor: false,
             tempo: None,
@@ -146,6 +237,25 @@ impl Options {
                 o.no_click = true;
                 continue;
             }
+            let switch = match flag.as_str() {
+                "--master" => Some(&mut o.master),
+                _ => None,
+            };
+            if let Some(switch) = switch {
+                *switch = true;
+                continue;
+            }
+            let toggle = match flag.as_str() {
+                "--mute" => Some((&mut o.mute, true)),
+                "--unmute" => Some((&mut o.mute, false)),
+                "--solo" => Some((&mut o.solo, true)),
+                "--unsolo" => Some((&mut o.solo, false)),
+                _ => None,
+            };
+            if let Some((setting, value)) = toggle {
+                *setting = Some(value);
+                continue;
+            }
             let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
                 "--device" => o.device = Some(value.clone()),
@@ -153,6 +263,11 @@ impl Options {
                 "--id" => o.id = Some(value.clone()),
                 "--plugin" => o.plugin = Some(value.clone()),
                 "--save" => o.save = Some(value.clone()),
+                "--track" => o.track = Some(index_from_one(value, "--track")?),
+                "--fx" => o.fx = Some(index_from_one(value, "--fx")?),
+                "--name" => o.name = Some(value.clone()),
+                "--volume" => o.volume = Some(value.parse()?),
+                "--pan" => o.pan = Some(value.parse()?),
                 "--tempo" => o.tempo = Some(value.parse()?),
                 "--seconds" => o.seconds = Some(value.parse()?),
                 "--freq" => o.freq = value.parse()?,
@@ -174,7 +289,26 @@ impl Options {
         if o.seconds.is_some_and(|s| s.is_nan() || s < 0.0) {
             return Err("--seconds must not be negative".into());
         }
+        if o.master && o.track.is_some() {
+            return Err("choose a track or the master, not both".into());
+        }
         Ok(o)
+    }
+
+    /// The track MIDI and recording go to, counted from 0.
+    fn live_track(&self) -> usize {
+        self.track.unwrap_or(0)
+    }
+
+    /// The plugin whose editor opens: an effect with --fx, of the master with
+    /// --master, or else the track's instrument.
+    fn editor_slot(&self) -> Result<Slot> {
+        match (self.fx, self.master) {
+            (Some(k), true) => Ok(Slot::Master(k)),
+            (Some(k), false) => Ok(Slot::Effect(self.live_track(), k)),
+            (None, false) => Ok(Slot::Instrument(self.live_track())),
+            (None, true) => Err("--master opens the editor of a master effect; add --fx".into()),
+        }
     }
 }
 
@@ -308,21 +442,29 @@ fn perform(path: &str, o: &Options, recording: bool) -> Result<()> {
     };
 
     // SAFETY: the user asked for this file to be loaded.
-    let mut plugin = unsafe { Plugin::open(Path::new(path), o.id.as_deref()) }?;
+    let mut session = unsafe { Session::open(Path::new(path), o.id.as_deref()) }?;
     if let Some(bpm) = o.tempo {
-        plugin.set_tempo(bpm);
+        session.set_tempo(bpm);
     }
-    let tempo = plugin.tempo();
+    let live = o.live_track();
+    session.check_track(live)?;
+    let slot = o.editor_slot()?;
+    let plugin_title = session.plugin(slot)?.describe();
+    let tempo = session.tempo();
     let output = Output::open(o.device.as_deref())?;
     let rate = output.sample_rate();
-    let processor = plugin.activate(rate, refrain_engine::MAX_BLOCK_FRAMES)?;
-    let mut sequencer = Sequencer::new(processor, plugin.sequence(rate));
+    let mixer = session.mixer(rate, refrain_engine::MAX_BLOCK_FRAMES, live, &[])?;
+    // The click goes on top of the mix, so no track's effects change it.
+    let mut sequencer = Sequencer::new(mixer, Vec::new());
     let click = if recording { !o.no_click } else { o.click };
     if click {
         sequencer = sequencer.with_click(tempo, 4);
     }
-    let plugin_title = plugin.describe();
-    println!("{plugin_title}");
+    println!(
+        "MIDI goes to track {}: {}",
+        live + 1,
+        session.plugin(Slot::Instrument(live))?.describe()
+    );
     println!("output: {}", output.describe());
     if click {
         println!("click at {} beats per minute", tempo.beats_per_minute);
@@ -377,7 +519,7 @@ fn perform(path: &str, o: &Options, recording: bool) -> Result<()> {
     // to stop.
     let mut taken = Recording::default();
     let mut demo = demo.into_iter().peekable();
-    let mut tick = |plugin: &mut Plugin| {
+    let mut tick = |session: &mut Session| {
         let elapsed = start.elapsed().as_secs_f64();
         if stop.load(Ordering::Acquire) || seconds.is_some_and(|s| elapsed >= s) {
             return false;
@@ -394,16 +536,16 @@ fn perform(path: &str, o: &Options, recording: bool) -> Result<()> {
         while let Ok((at, event)) = from_midi.pop() {
             taken.add(at.saturating_duration_since(start).as_secs_f64(), event);
         }
-        plugin.poll_main_thread();
+        session.poll_main_thread();
         true
     };
 
-    let shown = !o.no_editor && editor::run(&mut plugin, &plugin_title, &mut tick)?;
+    let shown = !o.no_editor && editor::run(&mut session, slot, &plugin_title, &mut tick)?;
     if !o.no_editor && !shown {
         println!("the plugin has no editor to show");
     }
     if !shown {
-        while tick(&mut plugin) {
+        while tick(&mut session) {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -421,37 +563,42 @@ fn perform(path: &str, o: &Options, recording: bool) -> Result<()> {
                 .into_iter()
                 .map(|(at, event)| (tempo.ticks_at(at), event))
                 .collect();
-            println!("recorded {} events into a new clip", events.len());
-            plugin.add_clip(&events);
+            println!(
+                "recorded {} events into a new clip on track {}",
+                events.len(),
+                live + 1
+            );
+            session.add_clip(live, &events);
         }
     }
     if let Some(project) = &save {
-        plugin.save_project(Path::new(project))?;
+        session.save(Path::new(project))?;
         println!("saved {project}");
     }
 
-    // The stream owns the plugin's processor. It has to stop before the
-    // plugin is destroyed.
+    // The stream owns the plugins' processors. It has to stop before the
+    // plugins are destroyed.
     drop(stream);
-    drop(plugin);
+    drop(session);
     Ok(())
 }
 
 fn editor_only(path: &str, o: &Options) -> Result<()> {
     // SAFETY: the user asked for this file to be loaded.
-    let mut plugin = unsafe { Plugin::open(Path::new(path), o.id.as_deref()) }?;
-    let title = plugin.describe();
+    let mut session = unsafe { Session::open(Path::new(path), o.id.as_deref()) }?;
+    let slot = o.editor_slot()?;
+    let title = session.plugin(slot)?.describe();
     println!("{title}");
     let start = Instant::now();
-    let mut tick = |plugin: &mut Plugin| {
-        plugin.poll_main_thread();
+    let mut tick = |session: &mut Session| {
+        session.poll_main_thread();
         o.seconds.is_none_or(|s| start.elapsed().as_secs_f64() < s)
     };
-    if !editor::run(&mut plugin, &title, &mut tick)? {
+    if !editor::run(&mut session, slot, &title, &mut tick)? {
         return Err("the plugin has no editor to show".into());
     }
     if let Some(project) = &o.save {
-        plugin.save_project(Path::new(project))?;
+        session.save(Path::new(project))?;
         println!("saved {project}");
     }
     Ok(())
@@ -474,35 +621,48 @@ fn render(path: &str, o: &Options) -> Result<()> {
         ),
         Some(plugin_path) => {
             // SAFETY: the user asked for this file to be loaded.
-            let mut plugin = unsafe { Plugin::open(Path::new(plugin_path), o.id.as_deref()) }?;
-            println!("{}", plugin.describe());
+            let mut session = unsafe { Session::open(Path::new(plugin_path), o.id.as_deref()) }?;
             if let Some(bpm) = o.tempo {
-                plugin.set_tempo(bpm);
+                session.set_tempo(bpm);
             }
-            let processor = plugin.activate(rate, block)?;
-            // A project's clips, or else the demo phrase.
-            let mut sequence = plugin.sequence(rate);
+            let live = o.live_track();
+            // The project's clips, or else the demo phrase on the track.
+            let mut demo = Vec::new();
             let mut frames = frames;
-            if sequence.is_empty() {
-                sequence = demo_phrase()
+            if session.project.end() == 0 {
+                session.check_track(live)?;
+                println!(
+                    "playing the demo phrase on track {}: {}",
+                    live + 1,
+                    session.plugin(Slot::Instrument(live))?.describe()
+                );
+                demo = demo_phrase()
                     .into_iter()
                     .map(|(t, event)| ((t * f64::from(o.rate)).round() as u64, event))
                     .collect();
             } else if o.seconds.is_none() {
                 // The clips, and a second for the sound to die away.
-                frames = plugin.sequence_end(rate) as usize + o.rate as usize;
+                frames = session.sequence_end(rate) as usize + o.rate as usize;
             }
-            let mut processor = Sequencer::new(processor, sequence);
-            let out = render_offline(&mut processor, rate, channels, frames, block, &[]);
-            if processor.has_failed() {
-                return Err("the plugin failed while processing".into());
+            let mut mixer = session.mixer(rate, block, live, &demo)?;
+            let out = render_offline(&mut mixer, rate, channels, frames, block, &[]);
+            if mixer.has_failed() {
+                return Err("a plugin failed while processing".into());
             }
-            drop(processor);
+            drop(mixer);
             out
         }
     };
 
-    let peak = samples.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+    let peak_of =
+        |samples: &mut dyn Iterator<Item = &f32>| samples.fold(0.0_f32, |m, s| m.max(s.abs()));
+    let peak = peak_of(&mut samples.iter());
+    let by_channel: Vec<String> = (0..channels)
+        .map(|c| {
+            let peak = peak_of(&mut samples.iter().skip(c).step_by(channels));
+            format!("{peak:.3}")
+        })
+        .collect();
     let written = samples.len() / channels;
     let spec = hound::WavSpec {
         channels: o.channels,
@@ -515,6 +675,9 @@ fn render(path: &str, o: &Options) -> Result<()> {
         writer.write_sample(s)?;
     }
     writer.finalize()?;
-    println!("wrote {written} frames to {path}, peak {peak:.3}");
+    println!(
+        "wrote {written} frames to {path}, peak {peak:.3} (channels: {})",
+        by_channel.join(" ")
+    );
     Ok(())
 }

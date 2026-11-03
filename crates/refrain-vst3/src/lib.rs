@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use refrain_engine::{
     ALL_NOTES_OFF, Event as PlayEvent, MAX_BLOCK_EVENTS, MAX_PEDAL_RELEASES, Processor, SUSTAIN,
-    SustainPedal, TimedEvent, interleave,
+    SustainPedal, TimedEvent, deinterleave, interleave,
 };
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
@@ -779,8 +779,16 @@ impl Processor for Vst3Processor {
             self.started = true;
         }
         self.push_events(events);
-        for buffer in &mut self.inputs {
-            buffer.fill(0.0);
+        // An effect hears what comes before it on its main input, the first.
+        // Other inputs, such as side chains, get silence.
+        let max = self.max_block_frames;
+        for (b, buffer) in self.inputs.iter_mut().enumerate() {
+            if b == 0 {
+                let plugin_channels = buffer.len() / max;
+                deinterleave(out, channels, buffer, plugin_channels, max);
+            } else {
+                buffer.fill(0.0);
+            }
         }
 
         let mut data = ProcessData {
@@ -810,7 +818,6 @@ impl Processor for Vst3Processor {
             out.fill(0.0);
             return;
         }
-        let max = self.max_block_frames;
         let main = &self.outputs[0];
         interleave(main, main.len() / max, max, out, channels);
     }

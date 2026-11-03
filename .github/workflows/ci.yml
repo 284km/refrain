@@ -66,6 +66,50 @@ jobs:
             cmp target/phrase-$f.wav target/demo-$f.wav
           done
           cmp target/phrase-clap.wav target/phrase-vst3.wav
+      # Tracks put together with the project commands mix the same in both
+      # formats, and the same as the projects kept here. Soloing, muting and
+      # removing an effect take the mix apart again.
+      - name: Mix tracks
+        shell: bash
+        run: |
+          p=target/test-plugins
+          for f in clap vst3; do
+            if [ $f = clap ]; then fx=dev.refrain.test-effect; else fx="refrain test effect"; fi
+            m=target/mix-$f.refrain
+            rm -f $m
+            cargo run -- new $m
+            cargo run -- track add $m tests/projects/phrase-$f.refrain
+            cargo run -- track add $m tests/projects/phrase-$f.refrain
+            cargo run -- fx add $m $p/refrain-test-synth.$f --id "$fx" --track 2
+            cargo run -- mix $m --track 2 --pan -0.5 --volume -6
+            cargo run -- fx add $m $p/refrain-test-synth.$f --id "$fx" --master
+            cargo run -- show $m
+            cargo run -- render target/mix-$f.wav --plugin $m | tee target/mix.log
+            # The master's effect clips at 0.25.
+            grep -q "peak 0.250" target/mix.log
+            cargo run -- render target/mix-kept-$f.wav --plugin tests/projects/mix-$f.refrain
+            cmp target/mix-$f.wav target/mix-kept-$f.wav
+            # Saving again keeps every plugin's state, the effects' too.
+            cargo run -- editor tests/projects/mix-$f.refrain --seconds 1 --save target/mix-resaved-$f.refrain
+            cargo run -- render target/mix-resaved-$f.wav --plugin target/mix-resaved-$f.refrain
+            cmp target/mix-$f.wav target/mix-resaved-$f.wav
+            # Track 1 alone, without the master's effect, is the phrase.
+            cargo run -- fx remove $m 1 --master
+            cargo run -- mix $m --track 1 --solo
+            cargo run -- render target/solo-$f.wav --plugin $m --seconds 2
+            cmp target/solo-$f.wav target/phrase-$f.wav
+            # Track 2 alone: clipped at 0.25 by its effect, then 6 dB down,
+            # and the right turned down by half more by the pan.
+            cargo run -- mix $m --track 1 --unsolo
+            cargo run -- mix $m --track 2 --solo
+            cargo run -- render target/solo-2-$f.wav --plugin $m --seconds 2 | tee target/mix.log
+            grep -q "channels: 0.125 0.063" target/mix.log
+            cargo run -- mix $m --track 1 --mute
+            cargo run -- mix $m --track 2 --unsolo --mute
+            cargo run -- render target/muted-$f.wav --plugin $m --seconds 2 | tee target/mix.log
+            grep -q "peak 0.000" target/mix.log
+          done
+          cmp target/mix-clap.wav target/mix-vst3.wav
       # Open each test plugin's editor in a real window, and check it ended up
       # inside that window.
       - name: Open the test plugins' editors
@@ -80,6 +124,7 @@ jobs:
           check_editor $p/refrain-test-synth.clap --id dev.refrain.test-synth.notes-only
           check_editor $p/refrain-test-synth.vst3
           check_editor $p/refrain-test-synth.vst3 --id "refrain test synth (notes only)"
+          check_editor $p/refrain-test-synth.vst3 --id "refrain test effect"
 
   licenses:
     runs-on: ubuntu-latest

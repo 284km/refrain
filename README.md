@@ -4,10 +4,11 @@ A DAW for macOS and Windows, written in Rust.
 
 [日本語](README.ja.md)
 
-> Status: very early. refrain hosts CLAP and VST3 instruments and plays them
-> from a MIDI input, sustain pedal and pitch bend included, on an audio device
-> or offline into a WAV file, with the plugin's editor open in a window.
-> refrain has no GUI of its own yet, only the `refrain` command.
+> Status: very early. refrain hosts CLAP and VST3 instruments and effects,
+> plays them from a MIDI input on an audio device or offline into a WAV file,
+> records MIDI clips, and mixes tracks, each an instrument with a chain of
+> effects, through a master chain. Plugin editors open in a window. refrain
+> has no GUI of its own yet, only the `refrain` command.
 
 ## Goals
 
@@ -23,10 +24,12 @@ crates/
   refrain-clap/             hosts CLAP plugins inside the engine
   refrain-vst3/             hosts VST3 plugins inside the engine
   refrain-test-tone/        the sound of the test plugins
-  refrain-test-synth/       CLAP test plugins, used to test hosting
+  refrain-test-synth/       CLAP test plugins, used to test hosting: two
+                            instruments and an effect
   refrain-test-synth-vst3/  VST3 test plugins that sound the same
   refrain-test-editor/      the test plugins' editor: a panel with their name
-  refrain-project/          project files: which plugin, and its state
+  refrain-project/          project files: tracks, plugins and their states,
+                            the mix, and clips
   refrain/                  the `refrain` command: audio devices, MIDI, WAV output
 scripts/
   build-test-plugins.sh     builds the test plugins as .clap and .vst3 files
@@ -88,7 +91,24 @@ cargo run -- play song.refrain                        # plays the clips, and you
 cargo run -- render out.wav --plugin song.refrain     # the clips, to a WAV file
 ```
 
-An installed instrument works the same way: pass its `.clap` or `.vst3`
+A project can hold several tracks. Each has an instrument, a chain of effects
+after it, a volume, a pan, and mute and solo; the mixed tracks go through the
+master's effects. These commands change a project without playing it:
+
+```sh
+p=target/test-plugins
+cargo run -- new band.refrain
+cargo run -- track add band.refrain $p/refrain-test-synth.vst3 --id "refrain test synth"
+cargo run -- track add band.refrain song.refrain          # song.refrain's tracks, clips and all
+cargo run -- fx add band.refrain $p/refrain-test-synth.vst3 --id "refrain test effect" --track 2
+cargo run -- mix band.refrain --track 2 --volume -6 --pan -0.5
+cargo run -- fx add band.refrain $p/refrain-test-synth.clap --id dev.refrain.test-effect --master
+cargo run -- show band.refrain
+cargo run -- record band.refrain --track 1                # MIDI goes to track 1
+cargo run -- editor band.refrain --track 2 --fx 1 --save band.refrain   # an effect's editor
+```
+
+An installed instrument or effect works the same way: pass its `.clap` or `.vst3`
 file or bundle. When a file holds several plugins, `--id` chooses one
 (for VST3, by name or class ID). Loading a plugin runs its code inside refrain.
 

@@ -5,13 +5,19 @@
 //! through both: the CLAP host and the VST3 host are each other's reference.
 //! The VST3 plugin that maps controllers plays the pedal itself; for the one
 //! that takes notes only, the host plays it. All three must agree.
+//!
+//! The module also holds an effect that doubles and clips, like the CLAP test
+//! effect. Chains of them must sound the same in either format, and in a mix
+//! of both.
 
 use clack_host::prelude::PluginEntry;
 use refrain_clap::ClapPlugin;
 use refrain_engine::{
-    ALL_NOTES_OFF, Event, PITCH_BEND_CENTRE, SUSTAIN, TimedEvent, render_offline,
+    ALL_NOTES_OFF, Event, Mix, Mixer, PITCH_BEND_CENTRE, Processor, SUSTAIN, TimedEvent, Track,
+    render_offline,
 };
-use refrain_test_synth_vst3::{FADE_SECONDS, NAME, NOTES_ONLY_NAME, PEAK, RIGHT_GAIN};
+use refrain_test_synth_vst3::{EFFECT_NAME, FADE_SECONDS, NAME, NOTES_ONLY_NAME, PEAK, RIGHT_GAIN};
+use refrain_test_tone::effect;
 use refrain_vst3::{Vst3Error, Vst3Module, Vst3Plugin};
 
 const RATE: f32 = 48_000.0;
@@ -121,16 +127,18 @@ fn all_agree(events: &[TimedEvent]) -> Vec<f32> {
 }
 
 #[test]
-fn lists_both_instruments() {
+fn lists_both_instruments_and_the_effect() {
     let plugins = module().plugins();
     let names: Vec<&str> = plugins.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, [NAME, NOTES_ONLY_NAME]);
+    assert_eq!(names, [NAME, NOTES_ONLY_NAME, EFFECT_NAME]);
+    let categories: Vec<&str> = plugins.iter().map(|p| p.categories.as_str()).collect();
+    assert_eq!(categories, ["Instrument|Synth", "Instrument|Synth", "Fx"]);
     for p in &plugins {
-        assert_eq!(p.categories, "Instrument|Synth");
         assert_eq!(p.vendor, "refrain");
         assert_eq!(p.id.len(), 32);
     }
     assert_ne!(plugins[0].id, plugins[1].id);
+    assert_ne!(plugins[1].id, plugins[2].id);
 }
 
 #[test]
@@ -408,5 +416,138 @@ fn a_broken_state_is_refused() {
         controller: Vec::new(),
     };
     let err = plugin.load_state(&broken).unwrap_err();
+    assert!(matches!(err, Vst3Error::State(_)), "{err}");
+}
+
+/// A plugin in a chain: the synth or the effect, in either format, with the
+/// effect's gain (`None` for the default).
+#[derive(Clone, Copy)]
+enum Slot {
+    ClapSynth,
+    Vst3Synth,
+    ClapEffect(Option<f32>),
+    Vst3Effect(Option<f32>),
+}
+
+/// Plays `events` through a track of `slots`, to a device with `channels`
+/// channels.
+fn render_chain(slots: &[Slot], channels: usize, events: &[TimedEvent]) -> Vec<f32> {
+    let entry =
+        PluginEntry::load_from_clack::<refrain_test_synth::Entry>(c"refrain-test-synth").unwrap();
+    let module = module();
+    let mut claps = Vec::new();
+    let mut vst3s = Vec::new();
+    let mut chain: Vec<Box<dyn Processor>> = Vec::new();
+    for slot in slots {
+        match *slot {
+            Slot::ClapSynth | Slot::ClapEffect(_) => {
+                let id = match slot {
+                    Slot::ClapSynth => refrain_test_synth::ID,
+                    _ => refrain_test_synth::EFFECT_ID,
+                };
+                let mut plugin = ClapPlugin::new(&entry, Some(id)).unwrap();
+                if let Slot::ClapEffect(Some(gain)) = slot {
+                    plugin.load_state(&effect::save_state(*gain)).unwrap();
+                }
+                chain.push(Box::new(plugin.activate(RATE, 1_024).unwrap()));
+                claps.push(plugin);
+            }
+            Slot::Vst3Synth | Slot::Vst3Effect(_) => {
+                let name = match slot {
+                    Slot::Vst3Synth => NAME,
+                    _ => EFFECT_NAME,
+                };
+                let mut plugin = Vst3Plugin::new(&module, Some(name)).unwrap();
+                if let Slot::Vst3Effect(Some(gain)) = slot {
+                    let state = refrain_vst3::Vst3State {
+                        component: effect::save_state(*gain).to_vec(),
+                        controller: Vec::new(),
+                    };
+                    plugin.load_state(&state).unwrap();
+                }
+                chain.push(Box::new(plugin.activate(RATE, 1_024).unwrap()));
+                vst3s.push(plugin);
+            }
+        }
+    }
+    let mut mixer =
+        Mixer::new(vec![Track::new(chain, Mix::default())], Vec::new(), 0.0).with_live_track(0);
+    let out = render_offline(&mut mixer, RATE, channels, FRAMES, 128, events);
+    assert!(!mixer.has_failed());
+    // The processors go before their plugins.
+    drop(mixer);
+    out
+}
+
+/// A chord loud enough for doubling to clip.
+fn chord() -> Vec<TimedEvent> {
+    let mut events = vec![on(0.1, 60, 1.0), on(0.1, 64, 1.0), on(0.1, 67, 1.0)];
+    events.extend([off(0.6, 60), off(0.6, 64), off(0.6, 67)]);
+    events
+}
+
+#[test]
+fn an_effect_changes_what_comes_before_it() {
+    let mut expected = render_vst3(NAME, 2, 128, &chord());
+    effect::process(effect::DEFAULT_GAIN, &mut expected);
+    let out = render_chain(&[Slot::Vst3Synth, Slot::Vst3Effect(None)], 2, &chord());
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn chains_sound_the_same_in_either_format_and_mixed() {
+    use Slot::*;
+    let (half, double) = (Some(0.5), Some(2.0));
+    let clap = render_chain(
+        &[ClapSynth, ClapEffect(double), ClapEffect(half)],
+        2,
+        &chord(),
+    );
+    let vst3 = render_chain(
+        &[Vst3Synth, Vst3Effect(double), Vst3Effect(half)],
+        2,
+        &chord(),
+    );
+    let mixed = render_chain(
+        &[ClapSynth, Vst3Effect(double), ClapEffect(half)],
+        2,
+        &chord(),
+    );
+    assert_eq!(vst3, clap);
+    assert_eq!(mixed, clap);
+    // The other order sounds different.
+    let swapped = render_chain(
+        &[Vst3Synth, Vst3Effect(half), Vst3Effect(double)],
+        2,
+        &chord(),
+    );
+    assert_ne!(swapped, vst3);
+}
+
+#[test]
+fn a_mono_device_feeds_an_effect_on_both_channels() {
+    let mut expected = render_vst3(NAME, 1, 128, &chord());
+    effect::process(effect::DEFAULT_GAIN, &mut expected);
+    let out = render_chain(&[Slot::Vst3Synth, Slot::Vst3Effect(None)], 1, &chord());
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn an_effect_keeps_its_gain_in_its_state() {
+    let module = module();
+    let mut plugin = Vst3Plugin::new(&module, Some(EFFECT_NAME)).unwrap();
+    let saved = plugin.save_state().unwrap();
+    assert_eq!(saved.component, effect::save_state(effect::DEFAULT_GAIN));
+    let half = refrain_vst3::Vst3State {
+        component: effect::save_state(0.5).to_vec(),
+        controller: Vec::new(),
+    };
+    plugin.load_state(&half).unwrap();
+    assert_eq!(plugin.save_state().unwrap().component, half.component);
+    let synth_state = refrain_vst3::Vst3State {
+        component: refrain_test_tone::save_state(0.5).to_vec(),
+        controller: Vec::new(),
+    };
+    let err = plugin.load_state(&synth_state).unwrap_err();
     assert!(matches!(err, Vst3Error::State(_)), "{err}");
 }

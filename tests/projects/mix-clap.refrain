@@ -1,0 +1,343 @@
+{
+  "refrain": 3,
+  "tempo": 120.0,
+  "ticks_per_beat": 960,
+  "tracks": [
+    {
+      "name": "refrain test synth",
+      "instrument": {
+        "format": "clap",
+        "path": "../../target/test-plugins/refrain-test-synth.clap",
+        "id": "dev.refrain.test-synth",
+        "name": "refrain test synth",
+        "state": {
+          "data": "cnRzMQAAgD8=",
+          "controller": ""
+        }
+      },
+      "effects": [],
+      "mix": {
+        "volume_db": 0.0,
+        "pan": 0.0,
+        "mute": false,
+        "solo": false
+      },
+      "clips": [
+        {
+          "start": 0,
+          "events": [
+            [
+              0,
+              [
+                176,
+                64,
+                127
+              ]
+            ],
+            [
+              0,
+              [
+                144,
+                60,
+                100
+              ]
+            ],
+            [
+              288,
+              [
+                128,
+                60,
+                100
+              ]
+            ],
+            [
+              384,
+              [
+                144,
+                64,
+                100
+              ]
+            ],
+            [
+              672,
+              [
+                128,
+                64,
+                100
+              ]
+            ],
+            [
+              768,
+              [
+                144,
+                67,
+                100
+              ]
+            ],
+            [
+              1056,
+              [
+                128,
+                67,
+                100
+              ]
+            ],
+            [
+              1152,
+              [
+                144,
+                72,
+                100
+              ]
+            ],
+            [
+              1440,
+              [
+                128,
+                72,
+                100
+              ]
+            ],
+            [
+              1824,
+              [
+                176,
+                64,
+                0
+              ]
+            ],
+            [
+              1920,
+              [
+                144,
+                60,
+                100
+              ]
+            ],
+            [
+              1920,
+              [
+                144,
+                64,
+                100
+              ]
+            ],
+            [
+              1920,
+              [
+                144,
+                67,
+                100
+              ]
+            ],
+            [
+              3456,
+              [
+                128,
+                60,
+                100
+              ]
+            ],
+            [
+              3456,
+              [
+                128,
+                64,
+                100
+              ]
+            ],
+            [
+              3456,
+              [
+                128,
+                67,
+                100
+              ]
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "refrain test synth",
+      "instrument": {
+        "format": "clap",
+        "path": "../../target/test-plugins/refrain-test-synth.clap",
+        "id": "dev.refrain.test-synth",
+        "name": "refrain test synth",
+        "state": {
+          "data": "cnRzMQAAgD8=",
+          "controller": ""
+        }
+      },
+      "effects": [
+        {
+          "format": "clap",
+          "path": "../../target/test-plugins/refrain-test-synth.clap",
+          "id": "dev.refrain.test-effect",
+          "name": "refrain test effect",
+          "state": {
+            "data": "",
+            "controller": ""
+          }
+        }
+      ],
+      "mix": {
+        "volume_db": -6.0,
+        "pan": -0.5,
+        "mute": false,
+        "solo": false
+      },
+      "clips": [
+        {
+          "start": 0,
+          "events": [
+            [
+              0,
+              [
+                176,
+                64,
+                127
+              ]
+            ],
+            [
+              0,
+              [
+                144,
+                60,
+                100
+              ]
+            ],
+            [
+              288,
+              [
+                128,
+                60,
+                100
+              ]
+            ],
+            [
+              384,
+              [
+                144,
+                64,
+                100
+              ]
+            ],
+            [
+              672,
+              [
+                128,
+                64,
+                100
+              ]
+            ],
+            [
+              768,
+              [
+                144,
+                67,
+                100
+              ]
+            ],
+            [
+              1056,
+              [
+                128,
+                67,
+                100
+              ]
+            ],
+            [
+              1152,
+              [
+                144,
+                72,
+                100
+              ]
+            ],
+            [
+              1440,
+              [
+                128,
+                72,
+                100
+              ]
+            ],
+            [
+              1824,
+              [
+                176,
+                64,
+                0
+              ]
+            ],
+            [
+              1920,
+              [
+                144,
+                60,
+                100
+              ]
+            ],
+            [
+              1920,
+              [
+                144,
+                64,
+                100
+              ]
+            ],
+            [
+              1920,
+              [
+                144,
+                67,
+                100
+              ]
+            ],
+            [
+              3456,
+              [
+                128,
+                60,
+                100
+              ]
+            ],
+            [
+              3456,
+              [
+                128,
+                64,
+                100
+              ]
+            ],
+            [
+              3456,
+              [
+                128,
+                67,
+                100
+              ]
+            ]
+          ]
+        }
+      ]
+    }
+  ],
+  "master": {
+    "effects": [
+      {
+        "format": "clap",
+        "path": "../../target/test-plugins/refrain-test-synth.clap",
+        "id": "dev.refrain.test-effect",
+        "name": "refrain test effect",
+        "state": {
+          "data": "",
+          "controller": ""
+        }
+      }
+    ],
+    "volume_db": 0.0
+  }
+}

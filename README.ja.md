@@ -4,10 +4,11 @@ macOS と Windows で動く DAW です。Rust で書いています。
 
 [English](README.md)
 
-> 状態: ごく初期の段階です。CLAP と VST3 のインストゥルメントを読み込み、MIDI 入力から
-> 鳴らせます。サステインペダルとピッチベンドも届きます。音はオーディオデバイスにも、
-> デバイスを使わずに WAV ファイルにも出せます。プラグインの画面はウィンドウで開けます。
-> refrain 自身の GUI はまだ無く、`refrain` コマンドだけです。
+> 状態: ごく初期の段階です。CLAP と VST3 のインストゥルメントとエフェクトを読み込み、
+> MIDI 入力から鳴らせます。音はオーディオデバイスにも、デバイスを使わずに WAV ファイルにも
+> 出せます。MIDI のクリップを録音でき、複数のトラック（それぞれインストゥルメントと
+> エフェクトの列）をミックスして、マスターのエフェクトに通せます。プラグインの画面は
+> ウィンドウで開けます。refrain 自身の GUI はまだ無く、`refrain` コマンドだけです。
 
 ## 目標
 
@@ -23,10 +24,12 @@ crates/
   refrain-clap/             CLAP プラグインをエンジンの中でホストする
   refrain-vst3/             VST3 プラグインをエンジンの中でホストする
   refrain-test-tone/        テスト用プラグインの音
-  refrain-test-synth/       ホスト機能のテストに使う CLAP のプラグイン
+  refrain-test-synth/       ホスト機能のテストに使う CLAP のプラグイン。
+                            インストゥルメント 2 つとエフェクト 1 つ
   refrain-test-synth-vst3/  同じ音の VST3 のプラグイン
   refrain-test-editor/      テスト用プラグインの画面。名前を出すだけのパネル
-  refrain-project/          プロジェクトファイル。使うプラグインとその状態
+  refrain-project/          プロジェクトファイル。トラック、プラグインとその状態、
+                            ミックス、クリップ
   refrain/                  `refrain` コマンド。オーディオデバイス、MIDI、WAV の出力
 scripts/
   build-test-plugins.sh     テスト用プラグインを .clap と .vst3 のファイルにする
@@ -86,7 +89,24 @@ cargo run -- play song.refrain                        # クリップが鳴り、
 cargo run -- render out.wav --plugin song.refrain     # クリップを WAV ファイルへ
 ```
 
-インストール済みのインストゥルメントも同じように、`.clap` か `.vst3` のファイル（またはバンドル）を
+1 つのプロジェクトに、複数のトラックを持てます。トラックごとに、インストゥルメント、その後ろに
+並ぶエフェクト、音量、パン、ミュートとソロがあります。ミックスしたトラックは、マスターの
+エフェクトを通ります。次のコマンドは、音を出さずにプロジェクトを書き換えます。
+
+```sh
+p=target/test-plugins
+cargo run -- new band.refrain
+cargo run -- track add band.refrain $p/refrain-test-synth.vst3 --id "refrain test synth"
+cargo run -- track add band.refrain song.refrain          # song.refrain のトラックをクリップごと
+cargo run -- fx add band.refrain $p/refrain-test-synth.vst3 --id "refrain test effect" --track 2
+cargo run -- mix band.refrain --track 2 --volume -6 --pan -0.5
+cargo run -- fx add band.refrain $p/refrain-test-synth.clap --id dev.refrain.test-effect --master
+cargo run -- show band.refrain
+cargo run -- record band.refrain --track 1                # MIDI はトラック 1 へ
+cargo run -- editor band.refrain --track 2 --fx 1 --save band.refrain   # エフェクトの画面
+```
+
+インストール済みのインストゥルメントやエフェクトも同じように、`.clap` か `.vst3` のファイル（またはバンドル）を
 渡せば使えます。1 つのファイルに複数のプラグインがあるときは `--id` で選びます（VST3 は名前か
 クラス ID）。プラグインを読み込むと、そのコードが refrain の中で動きます。
 

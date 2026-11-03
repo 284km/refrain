@@ -7,15 +7,20 @@
 //! The file holds two plugins that sound the same. One plays the sustain
 //! pedal itself from MIDI; for the other, which takes notes only, the host
 //! plays it. Both must give the same samples.
+//!
+//! The file also holds an effect that doubles and clips. Run after the synth
+//! in a track, it must give exactly the synth's samples, doubled and clipped.
 
 use clack_host::prelude::PluginEntry;
 use refrain_clap::{ClapError, ClapPlugin, plugins_in};
 use refrain_engine::{
-    ALL_NOTES_OFF, Event, PITCH_BEND_CENTRE, SUSTAIN, TimedEvent, render_offline,
+    ALL_NOTES_OFF, Event, Mix, Mixer, PITCH_BEND_CENTRE, Processor, SUSTAIN, TimedEvent, Track,
+    render_offline,
 };
 use refrain_test_synth::{
-    BEND_SEMITONES, FADE_SECONDS, ID, NOTES_ONLY_ID, PEAK, RIGHT_GAIN, key_frequency,
+    BEND_SEMITONES, EFFECT_ID, FADE_SECONDS, ID, NOTES_ONLY_ID, PEAK, RIGHT_GAIN, key_frequency,
 };
+use refrain_test_tone::effect;
 
 const RATE: f32 = 48_000.0;
 const FRAMES: usize = 38_400; // 0.8 s
@@ -115,13 +120,13 @@ fn silent(x: &[f32]) -> bool {
 const FADE: f64 = FADE_SECONDS as f64;
 
 #[test]
-fn lists_both_plugins() {
+fn lists_every_plugin() {
     let ids: Vec<String> = plugins_in(&entry())
         .unwrap()
         .into_iter()
         .map(|p| p.id)
         .collect();
-    assert_eq!(ids, [ID, NOTES_ONLY_ID]);
+    assert_eq!(ids, [ID, NOTES_ONLY_ID, EFFECT_ID]);
 }
 
 #[test]
@@ -360,5 +365,87 @@ fn a_broken_state_is_refused() {
     let entry = entry();
     let mut plugin = ClapPlugin::new(&entry, Some(ID)).unwrap();
     let err = plugin.load_state(b"not a state").unwrap_err();
+    assert!(matches!(err, ClapError::State(_)), "{err}");
+}
+
+/// Plays `events` on the synth followed by effects with these gains (`None`
+/// for the default), to a device with `channels` channels.
+fn render_chain(gains: &[Option<f32>], channels: usize, events: &[TimedEvent]) -> Vec<f32> {
+    let entry = entry();
+    let mut plugins = vec![ClapPlugin::new(&entry, Some(ID)).unwrap()];
+    for gain in gains {
+        let mut plugin = ClapPlugin::new(&entry, Some(EFFECT_ID)).unwrap();
+        if let Some(gain) = gain {
+            plugin.load_state(&effect::save_state(*gain)).unwrap();
+        }
+        plugins.push(plugin);
+    }
+    let chain: Vec<Box<dyn Processor>> = plugins
+        .iter_mut()
+        .map(|p| Box::new(p.activate(RATE, 1_024).unwrap()) as Box<dyn Processor>)
+        .collect();
+    let mut mixer =
+        Mixer::new(vec![Track::new(chain, Mix::default())], Vec::new(), 0.0).with_live_track(0);
+    let out = render_offline(&mut mixer, RATE, channels, FRAMES, 128, events);
+    assert!(!mixer.has_failed());
+    drop(mixer);
+    out
+}
+
+/// A chord loud enough for doubling to clip.
+fn chord() -> Vec<TimedEvent> {
+    let mut events = vec![on(0.1, 60, 1.0), on(0.1, 64, 1.0), on(0.1, 67, 1.0)];
+    events.extend([off(0.6, 60), off(0.6, 64), off(0.6, 67)]);
+    events
+}
+
+#[test]
+fn an_effect_changes_what_comes_before_it() {
+    let mut expected = render(ID, 128, &chord());
+    assert!(
+        peak(&expected) > effect::CEILING / 2.0,
+        "doubling must clip"
+    );
+    effect::process(effect::DEFAULT_GAIN, &mut expected);
+    assert_eq!(render_chain(&[None], 2, &chord()), expected);
+}
+
+#[test]
+fn effects_run_in_the_order_of_the_chain() {
+    let dry = render(ID, 128, &chord());
+    let apply = |gains: [f32; 2]| {
+        let mut x = dry.clone();
+        gains.iter().for_each(|&g| effect::process(g, &mut x));
+        x
+    };
+    let half_then_double = render_chain(&[Some(0.5), Some(2.0)], 2, &chord());
+    let double_then_half = render_chain(&[Some(2.0), Some(0.5)], 2, &chord());
+    assert_eq!(half_then_double, apply([0.5, 2.0]));
+    assert_eq!(double_then_half, apply([2.0, 0.5]));
+    assert_ne!(half_then_double, double_then_half);
+}
+
+#[test]
+fn a_mono_device_feeds_an_effect_on_both_channels() {
+    let mut expected = render_to(ID, 1, 128, &chord());
+    effect::process(effect::DEFAULT_GAIN, &mut expected);
+    assert_eq!(render_chain(&[None], 1, &chord()), expected);
+}
+
+#[test]
+fn an_effect_keeps_its_gain_in_its_state() {
+    let entry = entry();
+    let mut plugin = ClapPlugin::new(&entry, Some(EFFECT_ID)).unwrap();
+    let default = effect::save_state(effect::DEFAULT_GAIN).to_vec();
+    assert_eq!(plugin.save_state().unwrap(), Some(default));
+    plugin.load_state(&effect::save_state(0.5)).unwrap();
+    assert_eq!(
+        plugin.save_state().unwrap(),
+        Some(effect::save_state(0.5).to_vec())
+    );
+    // The synth's state is not the effect's.
+    let err = plugin
+        .load_state(&refrain_test_tone::save_state(0.5))
+        .unwrap_err();
     assert!(matches!(err, ClapError::State(_)), "{err}");
 }

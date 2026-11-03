@@ -15,14 +15,17 @@ pub const MAX_BLOCK_FRAMES: usize = 1024;
 pub const MAX_BLOCK_EVENTS: usize = 256;
 
 mod event;
+mod mixer;
 mod timeline;
 
 pub use event::{
     ALL_NOTES_OFF, Event, MAX_PEDAL_RELEASES, PITCH_BEND_CENTRE, SUSTAIN, SustainPedal, TimedEvent,
 };
+pub use mixer::{MAX_CHANNELS, Mix, Mixer, Track, gain_from_db};
 pub use timeline::{Recording, Sequencer, TICKS_PER_BEAT, Tempo};
 
-/// Something that fills audio buffers.
+/// Something that fills audio buffers: an instrument, an effect, or a chain
+/// or mix of them.
 ///
 /// `process` is called on the audio thread. It must not allocate, lock, block
 /// or do I/O: a 128-frame block at 48 kHz has about 2.7 ms to finish.
@@ -34,6 +37,9 @@ pub trait Processor: Send {
 
     /// Fills `out`, which holds interleaved frames of `channels` samples each.
     /// `events` belong to this block and are in order of frame.
+    ///
+    /// On entry `out` holds the processor's input: what came before it in a
+    /// chain, or silence. An instrument replaces it; an effect changes it.
     fn process(&mut self, out: &mut [f32], channels: usize, events: &[TimedEvent]);
 
     /// Whether the processor has failed and gives silence from now on, as a
@@ -118,6 +124,35 @@ pub fn interleave(
             *sample = match plugin_channels {
                 1 => planar[i],
                 n if c < n => planar[c * stride + i],
+                _ => 0.0,
+            };
+        }
+    }
+}
+
+/// Reads an interleaved device buffer into a plugin's input, the other way
+/// round from [`interleave`].
+///
+/// `planar` gets `plugin_channels` channels one after another, each `stride`
+/// samples long; the first `input.len() / channels` samples of each are
+/// written. A mono input goes to every plugin channel, a mono plugin gets the
+/// input mixed down, and plugin channels the input does not have get silence.
+pub fn deinterleave(
+    input: &[f32],
+    channels: usize,
+    planar: &mut [f32],
+    plugin_channels: usize,
+    stride: usize,
+) {
+    for (i, frame) in input.chunks_exact(channels).enumerate() {
+        if plugin_channels == 1 && channels > 1 {
+            planar[i] = frame.iter().sum::<f32>() / channels as f32;
+            continue;
+        }
+        for c in 0..plugin_channels {
+            planar[c * stride + i] = match channels {
+                1 => frame[0],
+                n if c < n => frame[c],
                 _ => 0.0,
             };
         }
@@ -213,6 +248,30 @@ mod tests {
         let first = render_offline(&mut sine, RATE, 1, 1_000, 128, &[]);
         let second = render_offline(&mut sine, RATE, 1, 1_000, 128, &[]);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn deinterleave_undoes_interleave() {
+        // Two frames of a stereo device buffer.
+        let device = [0.125, 0.25, 0.375, 0.5];
+        let mut planar = [9.0; 8];
+        deinterleave(&device, 2, &mut planar, 2, 4);
+        assert_eq!(planar, [0.125, 0.375, 9.0, 9.0, 0.25, 0.5, 9.0, 9.0]);
+        let mut back = [0.0; 4];
+        interleave(&planar, 2, 4, &mut back, 2);
+        assert_eq!(back, device);
+
+        // A mono plugin hears both channels; a stereo plugin hears a mono
+        // input on both; a plugin channel the input lacks is silent.
+        let mut mono = [0.0; 2];
+        deinterleave(&device, 2, &mut mono, 1, 2);
+        assert_eq!(mono, [0.1875, 0.4375]);
+        let mut stereo = [9.0; 4];
+        deinterleave(&[0.5, 0.25], 1, &mut stereo, 2, 2);
+        assert_eq!(stereo, [0.5, 0.25, 0.5, 0.25]);
+        let mut three = [9.0; 3];
+        deinterleave(&[0.1, 0.2], 2, &mut three, 3, 1);
+        assert_eq!(three, [0.1, 0.2, 0.0]);
     }
 
     /// Records the events it is given, with frames counted from the start.
