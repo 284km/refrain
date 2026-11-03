@@ -202,7 +202,7 @@ impl SynthProcessor {
                 {
                     continue;
                 }
-                let change = match u32::from(e.r#type) {
+                let change = match e.r#type as Event_::EventTypes {
                     Event_::EventTypes_::kNoteOnEvent => {
                         let n = unsafe { e.__field0.noteOn };
                         Change::NoteOn {
@@ -281,7 +281,10 @@ impl IComponentTrait for SynthProcessor {
         bus.mediaType = media_type;
         bus.direction = dir;
         bus.busType = BusTypes_::kMain as BusType;
-        bus.flags = BusInfo_::BusFlags_::kDefaultActive;
+        // VST3 enums are `c_int` on Windows and `c_uint` elsewhere.
+        #[allow(clippy::unnecessary_cast)]
+        let flags = BusInfo_::BusFlags_::kDefaultActive as u32;
+        bus.flags = flags;
         kResultOk
     }
 

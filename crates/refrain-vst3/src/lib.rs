@@ -405,9 +405,12 @@ impl Vst3Processor {
         context.tempo = 120.0;
         context.timeSigNumerator = 4;
         context.timeSigDenominator = 4;
-        context.state = ProcessContext_::StatesAndFlags_::kTempoValid
+        // VST3 enums are `c_int` on Windows and `c_uint` elsewhere.
+        #[allow(clippy::unnecessary_cast)]
+        let state = (ProcessContext_::StatesAndFlags_::kTempoValid
             | ProcessContext_::StatesAndFlags_::kTimeSigValid
-            | ProcessContext_::StatesAndFlags_::kContTimeValid;
+            | ProcessContext_::StatesAndFlags_::kContTimeValid) as u32;
+        context.state = state;
         let mut p = Self {
             processor,
             midi_map,

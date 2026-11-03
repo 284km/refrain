@@ -119,7 +119,10 @@ impl IBStreamTrait for MemoryStream {
     }
 
     unsafe fn seek(&self, pos: int64, mode: int32, result: *mut int64) -> tresult {
-        let base = match mode as u32 {
+        // VST3 enums are `c_int` on Windows and `c_uint` elsewhere.
+        #[allow(clippy::unnecessary_cast)]
+        let mode = mode as IBStream_::IStreamSeekMode;
+        let base = match mode {
             IBStream_::IStreamSeekMode_::kIBSeekSet => 0,
             IBStream_::IStreamSeekMode_::kIBSeekCur => self.position.get() as i64,
             IBStream_::IStreamSeekMode_::kIBSeekEnd => self.data.borrow().len() as i64,
