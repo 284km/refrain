@@ -18,6 +18,7 @@ mod com;
 mod module;
 
 use std::error::Error;
+use std::ffi::c_void;
 use std::fmt;
 use std::ptr;
 use std::sync::Arc;
@@ -30,7 +31,7 @@ use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{ComPtr, ComWrapper};
 
-use com::{ComponentHandler, EventList, HostApplication, MemoryStream, ParamChanges};
+use com::{ComponentHandler, EventList, HostApplication, MemoryStream, ParamChanges, PlugFrame};
 pub use module::{Vst3Info, Vst3Module, find_vst3_files, standard_paths};
 
 #[derive(Debug)]
@@ -42,6 +43,8 @@ pub enum Vst3Error {
     NotFound(String),
     /// A call into the plugin failed. Names the call.
     Call(&'static str),
+    /// Opening the editor failed at the named step.
+    Editor(&'static str),
     NoAudioOutput,
 }
 
@@ -57,6 +60,7 @@ impl fmt::Display for Vst3Error {
             ),
             Self::NotFound(name) => write!(f, "the VST3 module holds no plugin named {name}"),
             Self::Call(call) => write!(f, "the plugin failed {call}"),
+            Self::Editor(step) => write!(f, "the plugin's editor failed to {step}"),
             Self::NoAudioOutput => f.write_str("the plugin has no audio output"),
         }
     }
@@ -72,6 +76,14 @@ fn check(result: tresult, call: &'static str) -> Result<(), Vst3Error> {
     }
 }
 
+/// The size of a plugin's editor: in points on macOS, pixels elsewhere.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EditorSize {
+    pub width: u32,
+    pub height: u32,
+    pub resizable: bool,
+}
+
 /// MIDI controller numbers in VST3: the 128 of MIDI 1.0, then channel
 /// pressure and pitch bend.
 const CONTROLLERS: usize = 130;
@@ -82,6 +94,8 @@ type MidiMap = [[Option<ParamID>; CONTROLLERS]; 16];
 /// A plugin instance, owned by the main thread.
 pub struct Vst3Plugin {
     // Field order is drop order: the plugin's objects go before the module.
+    view: Option<ComPtr<IPlugView>>,
+    frame: ComWrapper<PlugFrame>,
     component: ComPtr<IComponent>,
     processor: ComPtr<IAudioProcessor>,
     controller: Option<ComPtr<IEditController>>,
@@ -121,7 +135,7 @@ impl Vst3Plugin {
             .as_com_ref::<IHostApplication>()
             .expect("the host implements IHostApplication")
             .as_ptr() as *mut FUnknown;
-        let handler = ComWrapper::new(ComponentHandler);
+        let handler = ComWrapper::new(ComponentHandler::default());
 
         let component: ComPtr<IComponent> = module
             .create(&info.cid)
@@ -149,6 +163,8 @@ impl Vst3Plugin {
         };
 
         let mut plugin = Self {
+            view: None,
+            frame: ComWrapper::new(PlugFrame::default()),
             component,
             processor,
             controller,
@@ -259,6 +275,10 @@ impl Vst3Plugin {
         check(unsafe { self.component.setActive(1) }, "to activate")?;
         self.active = true;
 
+        // Edits made in the plugin's editor reach the processor through this.
+        let (to_processor, edits) = rtrb::RingBuffer::new(1024);
+        self._handler.send_edits_to(to_processor);
+
         Ok(Vst3Processor::new(
             self.processor.clone(),
             self.midi_map(),
@@ -268,7 +288,109 @@ impl Vst3Plugin {
             max_block_frames,
             Arc::clone(&self.alive),
             self.module.clone(),
+            edits,
         ))
+    }
+
+    /// Opens the plugin's editor inside `parent`, at the window's `scale`.
+    ///
+    /// Returns the editor's size, in points on macOS and pixels elsewhere,
+    /// or `None` when the plugin has no editor for this kind of window.
+    ///
+    /// # Safety
+    ///
+    /// `parent` must stay valid until [`close_editor`](Self::close_editor).
+    pub unsafe fn open_editor(
+        &mut self,
+        parent: raw_window_handle::RawWindowHandle,
+        scale: f64,
+    ) -> Result<Option<EditorSize>, Vst3Error> {
+        use raw_window_handle::RawWindowHandle as Raw;
+        self.close_editor();
+        let (window, platform): (*mut c_void, FIDString) = match parent {
+            Raw::AppKit(h) => (h.ns_view.as_ptr(), kPlatformTypeNSView),
+            Raw::Win32(h) => (h.hwnd.get() as *mut c_void, kPlatformTypeHWND),
+            Raw::Xlib(h) => (h.window as *mut c_void, kPlatformTypeX11EmbedWindowID),
+            _ => return Ok(None),
+        };
+        let Some(controller) = &self.controller else {
+            return Ok(None);
+        };
+        let Some(view) = (unsafe { ComPtr::from_raw(controller.createView(c"editor".as_ptr())) })
+        else {
+            return Ok(None);
+        };
+        if unsafe { view.isPlatformTypeSupported(platform) } != kResultTrue {
+            return Ok(None);
+        }
+        unsafe {
+            if let Some(frame) = self.frame.as_com_ref::<IPlugFrame>() {
+                view.setFrame(frame.as_ptr());
+            }
+            if !cfg!(target_os = "macos")
+                && let Some(scaling) = view.cast::<IPlugViewContentScaleSupport>()
+            {
+                scaling.setContentScaleFactor(scale as f32);
+            }
+            if view.attached(window, platform) != kResultOk {
+                view.setFrame(ptr::null_mut());
+                return Err(Vst3Error::Editor("attach"));
+            }
+        }
+        let mut rect = ViewRect {
+            left: 0,
+            top: 0,
+            right: 640,
+            bottom: 480,
+        };
+        unsafe { view.getSize(&mut rect) };
+        let resizable = unsafe { view.canResize() } == kResultTrue;
+        self.view = Some(view);
+        Ok(Some(EditorSize {
+            width: (rect.right - rect.left).max(1) as u32,
+            height: (rect.bottom - rect.top).max(1) as u32,
+            resizable,
+        }))
+    }
+
+    /// Tells the editor its window changed size, and returns the size it took.
+    pub fn resize_editor(&mut self, width: u32, height: u32) -> (u32, u32) {
+        let Some(view) = &self.view else {
+            return (width, height);
+        };
+        let mut rect = ViewRect {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
+        unsafe {
+            if view.canResize() == kResultTrue {
+                view.checkSizeConstraint(&mut rect);
+                view.onSize(&mut rect);
+            } else {
+                view.getSize(&mut rect);
+            }
+        }
+        (
+            (rect.right - rect.left).max(1) as u32,
+            (rect.bottom - rect.top).max(1) as u32,
+        )
+    }
+
+    /// A size the editor asked its window to take, if it asked since the last
+    /// call.
+    pub fn take_editor_resize_request(&self) -> Option<(u32, u32)> {
+        self.frame.take_request()
+    }
+
+    pub fn close_editor(&mut self) {
+        if let Some(view) = self.view.take() {
+            unsafe {
+                view.removed();
+                view.setFrame(ptr::null_mut());
+            }
+        }
     }
 
     /// Reads which controllers the plugin maps to which parameters.
@@ -317,6 +439,7 @@ fn connect(
 
 impl Drop for Vst3Plugin {
     fn drop(&mut self) {
+        self.close_editor();
         if Arc::strong_count(&self.alive) > 1 {
             // The processor is still running somewhere. Tearing the plugin
             // down under it would crash; leak it instead.
@@ -372,6 +495,8 @@ pub struct Vst3Processor {
     pedal: SustainPedal,
     to_pedal: Vec<TimedEvent>,
     notes: Vec<TimedEvent>,
+    // Edits from the plugin's editor.
+    edits: rtrb::Consumer<(ParamID, ParamValue)>,
     started: bool,
     failed: bool,
     _alive: Arc<()>,
@@ -393,6 +518,7 @@ impl Vst3Processor {
         max_block_frames: usize,
         alive: Arc<()>,
         module: Vst3Module,
+        edits: rtrb::Consumer<(ParamID, ParamValue)>,
     ) -> Self {
         let alloc = |channels: &[i32]| -> Vec<Vec<f32>> {
             channels
@@ -428,6 +554,7 @@ impl Vst3Processor {
             pedal: SustainPedal::default(),
             to_pedal: Vec::with_capacity(MAX_BLOCK_EVENTS),
             notes: Vec::with_capacity(MAX_EVENTS),
+            edits,
             started: false,
             failed: false,
             _alive: alive,
@@ -469,6 +596,7 @@ impl Vst3Processor {
 
     /// Turns the block's events into VST3 notes and parameter changes.
     ///
+    /// Edits from the plugin's editor come first, at the start of the block.
     /// Controllers the plugin maps become changes to their parameters.
     /// Everything else goes through the host's sustain pedal, which holds
     /// notes for an unmapped pedal and drops other unmapped controllers.
@@ -477,6 +605,11 @@ impl Vst3Processor {
         list.clear();
         self.params.clear();
         self.to_pedal.clear();
+        // Edits made in the editor since the last block take effect at its
+        // start. The plugin's controller already has them.
+        while let Ok((id, value)) = self.edits.pop() {
+            unsafe { self.params.push(id, 0, value) };
+        }
         for e in events.iter().take(MAX_BLOCK_EVENTS) {
             let mapped =
                 |channel: u8, number: usize| self.midi_map[usize::from(channel & 0x0f)][number];

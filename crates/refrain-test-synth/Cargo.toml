@@ -13,5 +13,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 refrain-test-tone = { path = "../refrain-test-tone" }
+refrain-test-editor = { path = "../refrain-test-editor" }
 clack-plugin = "0.2"
-clack-extensions = { version = "0.2", features = ["clack-plugin", "audio-ports", "note-ports"] }
+clack-extensions = { version = "0.2", features = ["clack-plugin", "audio-ports", "note-ports", "gui"] }

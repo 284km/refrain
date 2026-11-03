@@ -6,7 +6,8 @@ A DAW for macOS and Windows, written in Rust.
 
 > Status: very early. refrain hosts CLAP and VST3 instruments and plays them
 > from a MIDI input, sustain pedal and pitch bend included, on an audio device
-> or offline into a WAV file. There is no GUI yet, only the `refrain` command.
+> or offline into a WAV file, with the plugin's editor open in a window.
+> refrain has no GUI of its own yet, only the `refrain` command.
 
 ## Goals
 
@@ -24,6 +25,7 @@ crates/
   refrain-test-tone/        the sound of the test plugins
   refrain-test-synth/       CLAP test plugins, used to test hosting
   refrain-test-synth-vst3/  VST3 test plugins that sound the same
+  refrain-test-editor/      the test plugins' editor: a panel with their name
   refrain/                  the `refrain` command: audio devices, MIDI, WAV output
 scripts/
   build-test-plugins.sh     builds the test plugins as .clap and .vst3 files
@@ -57,7 +59,11 @@ scripts/build-test-plugins.sh
 cargo run -- play target/test-plugins/refrain-test-synth.clap          # from a MIDI keyboard
 cargo run -- play target/test-plugins/refrain-test-synth.vst3 --demo   # a short phrase
 cargo run -- render out.wav --plugin target/test-plugins/refrain-test-synth.vst3
+cargo run -- editor target/test-plugins/refrain-test-synth.clap        # the editor alone
 ```
+
+`play` opens the plugin's editor in a window when it has one; `--no-editor`
+leaves it closed.
 
 An installed instrument works the same way: pass its `.clap` or `.vst3`
 file or bundle. When a file holds several plugins, `--id` chooses one

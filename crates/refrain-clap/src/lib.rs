@@ -14,9 +14,13 @@ use std::error::Error;
 use std::ffi::CString;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clack_extensions::audio_ports::{AudioPortFlags, AudioPortInfoBuffer, PluginAudioPorts};
+use clack_extensions::gui::{
+    GuiApiType, GuiConfiguration, GuiSize, HostGui, HostGuiImpl, PluginGui, Window as ClapWindow,
+};
 use clack_extensions::log::{HostLog, HostLogImpl, LogSeverity};
 use clack_extensions::note_ports::{NoteDialects, NotePortInfoBuffer, PluginNotePorts};
 use clack_extensions::params::{
@@ -63,6 +67,8 @@ pub enum ClapError {
     Ambiguous(Vec<String>),
     NotFound(String),
     NoAudioOutput,
+    /// Opening the editor failed at the named step.
+    Editor(&'static str),
     Instance(PluginInstanceError),
 }
 
@@ -79,6 +85,7 @@ impl fmt::Display for ClapError {
             ),
             Self::NotFound(id) => write!(f, "the CLAP file holds no plugin with id {id}"),
             Self::NoAudioOutput => f.write_str("the plugin has no audio output"),
+            Self::Editor(step) => write!(f, "the plugin's editor failed to {step}"),
             Self::Instance(e) => write!(f, "{e}"),
         }
     }
@@ -192,13 +199,19 @@ impl HostHandlers for RefrainHost {
     type AudioProcessor<'a> = ();
 
     fn declare_extensions(builder: &mut HostExtensions<Self>, _shared: &Self::Shared<'_>) {
-        builder.register::<HostLog>().register::<HostParams>();
+        builder
+            .register::<HostLog>()
+            .register::<HostParams>()
+            .register::<HostGui>();
     }
 }
 
 /// Host state any of the plugin's threads may touch.
 pub struct HostShared {
     callback_requested: AtomicBool,
+    // Requests from the plugin's editor, answered on the main thread.
+    resize_requested: Mutex<Option<GuiSize>>,
+    editor_closed: AtomicBool,
 }
 
 impl SharedHandler<'_> for HostShared {
@@ -225,6 +238,27 @@ impl HostLogImpl for HostShared {
     }
 }
 
+impl HostGuiImpl for HostShared {
+    fn resize_hints_changed(&self) {}
+
+    fn request_resize(&self, new_size: GuiSize) -> Result<(), HostError> {
+        *self.resize_requested.lock().unwrap() = Some(new_size);
+        Ok(())
+    }
+
+    fn request_show(&self) -> Result<(), HostError> {
+        Ok(())
+    }
+
+    fn request_hide(&self) -> Result<(), HostError> {
+        Ok(())
+    }
+
+    fn closed(&self, _was_destroyed: bool) {
+        self.editor_closed.store(true, Ordering::Release);
+    }
+}
+
 impl HostParamsImplShared for HostShared {
     fn request_flush(&self) {
         // Processing never stops, so parameters are flushed in process().
@@ -244,6 +278,7 @@ impl HostParamsImplMainThread for HostMainThread {
 
 /// A plugin instance, owned by the main thread.
 pub struct ClapPlugin {
+    editor: Option<Editor>,
     instance: PluginInstance<RefrainHost>,
     info: PluginInfo,
 }
@@ -279,13 +314,117 @@ impl ClapPlugin {
         let instance = PluginInstance::<RefrainHost>::new(
             |_| HostShared {
                 callback_requested: AtomicBool::new(false),
+                resize_requested: Mutex::new(None),
+                editor_closed: AtomicBool::new(false),
             },
             |_| HostMainThread,
             entry,
             &plugin_id,
             &host_info,
         )?;
-        Ok(Self { instance, info })
+        Ok(Self {
+            editor: None,
+            instance,
+            info,
+        })
+    }
+
+    /// Opens the plugin's editor inside `parent`, at the window's `scale`.
+    ///
+    /// Returns the editor's size, in points on macOS and pixels elsewhere,
+    /// or `None` when the plugin has no editor that can be embedded.
+    ///
+    /// # Safety
+    ///
+    /// `parent` must stay valid until [`close_editor`](Self::close_editor).
+    pub unsafe fn open_editor(
+        &mut self,
+        parent: raw_window_handle::RawWindowHandle,
+        scale: f64,
+    ) -> Result<Option<EditorSize>, ClapError> {
+        self.close_editor();
+        let handle = self.instance.plugin_handle();
+        let Some(gui) = handle.get_extension::<PluginGui>() else {
+            return Ok(None);
+        };
+        let Some(api_type) = GuiApiType::default_for_current_platform() else {
+            return Ok(None);
+        };
+        let config = GuiConfiguration {
+            api_type,
+            is_floating: false,
+        };
+        if !gui.is_api_supported(&handle, config) {
+            return Ok(None);
+        }
+        let failed = |what: &'static str| ClapError::Editor(what);
+        gui.create(&handle, config).map_err(|_| failed("create"))?;
+        if !api_type.uses_logical_size() {
+            let _ = gui.set_scale(&handle, scale);
+        }
+        let size = gui.get_size(&handle).unwrap_or(GuiSize {
+            width: 640,
+            height: 480,
+        });
+        use raw_window_handle::RawWindowHandle as Raw;
+        let window = match parent {
+            Raw::AppKit(h) => unsafe { ClapWindow::from_cocoa_nsview(h.ns_view.as_ptr()) },
+            Raw::Win32(h) => unsafe { ClapWindow::from_win32_hwnd(h.hwnd.get() as *mut _) },
+            Raw::Xlib(h) => ClapWindow::from_x11_handle(h.window),
+            _ => return Err(failed("embed in this kind of window")),
+        };
+        if unsafe { gui.set_parent(&handle, window) }.is_err() {
+            gui.destroy(&handle);
+            return Err(failed("set_parent"));
+        }
+        // Some plugins draw nothing until shown; others refuse to be.
+        let _ = gui.show(&handle);
+        let resizable = gui.can_resize(&handle);
+        self.instance
+            .access_shared_handler(|h| h.editor_closed.store(false, Ordering::Release));
+        self.editor = Some(Editor { gui, resizable });
+        Ok(Some(EditorSize {
+            width: size.width,
+            height: size.height,
+            resizable,
+        }))
+    }
+
+    /// Asks the editor to take a new size, and returns the size it took.
+    pub fn resize_editor(&mut self, width: u32, height: u32) -> (u32, u32) {
+        let Some(editor) = &self.editor else {
+            return (width, height);
+        };
+        let handle = self.instance.plugin_handle();
+        let wanted = GuiSize { width, height };
+        let size = if editor.resizable {
+            let size = editor.gui.adjust_size(&handle, wanted).unwrap_or(wanted);
+            let _ = editor.gui.set_size(&handle, size);
+            size
+        } else {
+            editor.gui.get_size(&handle).unwrap_or(wanted)
+        };
+        (size.width, size.height)
+    }
+
+    /// A size the editor asked its window to take, if it asked since the last
+    /// call.
+    pub fn take_editor_resize_request(&self) -> Option<(u32, u32)> {
+        self.instance
+            .access_shared_handler(|h| h.resize_requested.lock().unwrap().take())
+            .map(|s| (s.width, s.height))
+    }
+
+    /// Whether the plugin closed its own editor.
+    pub fn editor_closed(&self) -> bool {
+        self.instance
+            .access_shared_handler(|h| h.editor_closed.load(Ordering::Acquire))
+    }
+
+    pub fn close_editor(&mut self) {
+        if let Some(editor) = self.editor.take() {
+            editor.gui.destroy(&self.instance.plugin_handle());
+        }
     }
 
     pub fn info(&self) -> &PluginInfo {
@@ -380,6 +519,27 @@ impl ClapPlugin {
             failed: false,
         })
     }
+}
+
+impl Drop for ClapPlugin {
+    fn drop(&mut self) {
+        // The editor goes before the plugin it belongs to.
+        self.close_editor();
+    }
+}
+
+/// An open editor.
+struct Editor {
+    gui: PluginGui,
+    resizable: bool,
+}
+
+/// The size of a plugin's editor: in points on macOS, pixels elsewhere.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EditorSize {
+    pub width: u32,
+    pub height: u32,
+    pub resizable: bool,
 }
 
 /// The most events one block can hand a plugin: the block's own, plus the

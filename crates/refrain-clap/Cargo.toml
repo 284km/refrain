@@ -10,7 +10,8 @@ publish.workspace = true
 [dependencies]
 refrain-engine.workspace = true
 clack-host = "0.2"
-clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "note-ports", "log", "params"] }
+clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "note-ports", "log", "params", "gui"] }
+raw-window-handle = "0.6"
 
 [dev-dependencies]
 clack-host = { version = "0.2", features = ["clack-plugin"] }

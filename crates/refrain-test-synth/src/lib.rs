@@ -11,11 +11,15 @@
 //! - [`NOTES_ONLY_ID`] takes CLAP notes and nothing else, so the host has to
 //!   play the sustain pedal for it.
 
+use std::cell::RefCell;
 use std::ffi::CStr;
 
 use clack_extensions::audio_ports::{
     AudioPortFlags, AudioPortInfo, AudioPortInfoWriter, AudioPortType, PluginAudioPorts,
     PluginAudioPortsImpl,
+};
+use clack_extensions::gui::{
+    GuiApiType, GuiConfiguration, GuiSize, PluginGui, PluginGuiImpl, Window,
 };
 use clack_extensions::note_ports::{
     NoteDialect, NoteDialects, NotePortInfo, NotePortInfoWriter, PluginNotePorts,
@@ -45,7 +49,8 @@ impl Plugin for TestSynth {
     fn declare_extensions(builder: &mut PluginExtensions<Self>, _shared: Option<&SynthShared>) {
         builder
             .register::<PluginAudioPorts>()
-            .register::<PluginNotePorts>();
+            .register::<PluginNotePorts>()
+            .register::<PluginGui>();
     }
 }
 
@@ -58,6 +63,7 @@ impl PluginShared<'_> for SynthShared {}
 
 pub struct SynthMainThread<'a> {
     shared: &'a SynthShared,
+    editor: RefCell<Option<refrain_test_editor::Panel>>,
 }
 
 impl<'a> PluginMainThread<'a, SynthShared> for SynthMainThread<'a> {}
@@ -120,7 +126,12 @@ impl PluginFactoryImpl for Factory {
             host_info,
             descriptor,
             move |_host| Ok(SynthShared { takes_midi }),
-            |_host, shared| Ok(SynthMainThread { shared }),
+            |_host, shared| {
+                Ok(SynthMainThread {
+                    shared,
+                    editor: RefCell::new(None),
+                })
+            },
         ))
     }
 }
@@ -250,6 +261,75 @@ impl PluginNotePortsImpl for SynthMainThread<'_> {
                 supported_dialects,
             });
         }
+    }
+}
+
+/// The editor: a panel with the plugin's name, embedded in the host's window.
+impl PluginGuiImpl for SynthMainThread<'_> {
+    fn is_api_supported(&self, configuration: GuiConfiguration) -> bool {
+        !configuration.is_floating
+            && Some(configuration.api_type) == GuiApiType::default_for_current_platform()
+    }
+
+    fn get_preferred_api(&self) -> Option<GuiConfiguration<'_>> {
+        Some(GuiConfiguration {
+            api_type: GuiApiType::default_for_current_platform()?,
+            is_floating: false,
+        })
+    }
+
+    fn create(&self, _configuration: GuiConfiguration) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    fn destroy(&self) {
+        self.editor.take();
+    }
+
+    fn set_scale(&self, _scale: f64) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    fn get_size(&self) -> Option<GuiSize> {
+        Some(GuiSize {
+            width: refrain_test_editor::WIDTH,
+            height: refrain_test_editor::HEIGHT,
+        })
+    }
+
+    fn set_size(&self, _size: GuiSize) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    fn set_parent(&self, window: Window) -> Result<(), PluginError> {
+        let parent = window
+            .as_cocoa_nsview()
+            .or_else(|| window.as_win32_hwnd())
+            .ok_or(PluginError::Message("unsupported window"))?;
+        let name = if self.shared.takes_midi {
+            "refrain test synth"
+        } else {
+            "refrain test synth (notes only)"
+        };
+        // SAFETY: the host gives a live window and calls this on the main
+        // thread.
+        let panel = unsafe { refrain_test_editor::Panel::attach(parent, name) }.ok_or(
+            PluginError::Message("could not add the editor to the window"),
+        )?;
+        *self.editor.borrow_mut() = Some(panel);
+        Ok(())
+    }
+
+    fn set_transient(&self, _window: Window) -> Result<(), PluginError> {
+        Err(PluginError::Message("only embedded editors"))
+    }
+
+    fn show(&self) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    fn hide(&self) -> Result<(), PluginError> {
+        Ok(())
     }
 }
 

@@ -272,3 +272,69 @@ fn stereo_is_mixed_down_for_mono_and_padded_for_more_channels() {
         assert_eq!(q, &[lr[0], lr[1], 0.0, 0.0]);
     }
 }
+
+/// Runs `processor` block by block, calling `before` with each block's index
+/// first. Events carry frames counted from the start, as for render_offline.
+fn render_with(
+    processor: &mut dyn refrain_engine::Processor,
+    block: usize,
+    events: &[TimedEvent],
+    mut before: impl FnMut(usize),
+) -> Vec<f32> {
+    processor.prepare(RATE, block);
+    let mut out = vec![0.0; FRAMES * 2];
+    for (b, chunk) in out.chunks_mut(block * 2).enumerate() {
+        before(b);
+        let (start, end) = ((b * block) as u32, (b * block + chunk.len() / 2) as u32);
+        let here: Vec<TimedEvent> = events
+            .iter()
+            .filter(|e| (start..end).contains(&e.frame))
+            .map(|e| TimedEvent {
+                frame: e.frame - start,
+                ..*e
+            })
+            .collect();
+        processor.process(chunk, 2, &here);
+    }
+    out
+}
+
+#[test]
+fn edits_in_the_editor_reach_the_processor() {
+    use refrain_test_synth_vst3::{edit_from_editor, params};
+    let block = 128;
+    let notes = [on(0.1, 69, 1.0), off(0.3, 69)];
+    let (down, up) = (s(0.2) as usize / block, s(0.5) as usize / block);
+
+    // The pedal from the editor, which the host applies at a block's start...
+    let module = module();
+    let mut plugin = Vst3Plugin::new(&module, Some(NAME)).unwrap();
+    let mut processor = plugin.activate(RATE, 1_024).unwrap();
+    let edited = render_with(&mut processor, block, &notes, |b| {
+        if b == down {
+            edit_from_editor(params::SUSTAIN, 1.0);
+        } else if b == up {
+            edit_from_editor(params::SUSTAIN, 0.0);
+        }
+    });
+    drop(processor);
+    drop(plugin);
+
+    // ...sounds like the pedal from MIDI at those same samples.
+    let mut with_cc = notes.to_vec();
+    with_cc.push(TimedEvent {
+        frame: (down * block) as u32,
+        event: cc(0.0, SUSTAIN, 127).event,
+    });
+    with_cc.push(TimedEvent {
+        frame: (up * block) as u32,
+        event: cc(0.0, SUSTAIN, 0).event,
+    });
+    with_cc.sort_by_key(|e| e.frame);
+    assert_eq!(edited, render_vst3(NAME, 2, block, &with_cc));
+    assert_ne!(
+        edited,
+        render_vst3(NAME, 2, block, &notes),
+        "the edit had no effect"
+    );
+}

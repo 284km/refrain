@@ -4,6 +4,7 @@
 //! hosting work on a real device and offline. The GUI comes later.
 
 mod audio;
+mod editor;
 mod midi;
 mod plugin;
 
@@ -29,7 +30,9 @@ usage:
   refrain midi                          list MIDI inputs
   refrain plugins                       list installed CLAP and VST3 plugins
   refrain sine [options]                play a sine wave
-  refrain play <plugin> [options]       play a .clap or .vst3 instrument from MIDI
+  refrain play <plugin> [options]       play a .clap or .vst3 instrument from MIDI,
+                                        with its editor open
+  refrain editor <plugin> [options]     open a plugin's editor, without audio
   refrain render <out.wav> [options]    write a sine wave, or a plugin playing
                                         a short phrase with --plugin, to a WAV file
 
@@ -39,7 +42,8 @@ options:
   --id <id|name>     which plugin, when a file holds several (VST3: name or class ID)
   --plugin <path>    render through this .clap or .vst3 plugin
   --demo             play the short phrase instead of reading MIDI (play)
-  --seconds <s>      length (default 2; play runs until Enter without it)
+  --no-editor        do not open the plugin's editor (play)
+  --seconds <s>      length (default 2; play and editor run until closed without it)
   --freq <hz>        sine frequency (default 440)
   --amp <0..1>       sine amplitude (default 0.2)
   --rate <hz>        sample rate (render, default 48000)
@@ -61,6 +65,7 @@ fn main() -> ExitCode {
         Some("plugins") => list_plugins(),
         Some("sine") => Options::parse(&args[1..]).and_then(|o| sine(&o)),
         Some("play") => with_path(play, "play"),
+        Some("editor") => with_path(editor_only, "editor"),
         Some("render") => with_path(render, "render"),
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
@@ -83,6 +88,7 @@ struct Options {
     id: Option<String>,
     plugin: Option<String>,
     demo: bool,
+    no_editor: bool,
     seconds: Option<f64>,
     freq: f64,
     amp: f32,
@@ -98,6 +104,7 @@ impl Options {
             id: None,
             plugin: None,
             demo: false,
+            no_editor: false,
             seconds: None,
             freq: 440.0,
             amp: 0.2,
@@ -108,6 +115,10 @@ impl Options {
         while let Some(flag) = it.next() {
             if flag == "--demo" {
                 o.demo = true;
+                continue;
+            }
+            if flag == "--no-editor" {
+                o.no_editor = true;
                 continue;
             }
             let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
@@ -245,7 +256,8 @@ fn play(path: &str, o: &Options) -> Result<()> {
     let mut plugin = unsafe { Plugin::open(Path::new(path), o.id.as_deref()) }?;
     let output = Output::open(o.device.as_deref())?;
     let processor = plugin.activate(output.sample_rate(), refrain_engine::MAX_BLOCK_FRAMES)?;
-    println!("{}", plugin.describe());
+    let plugin_title = plugin.describe();
+    println!("{plugin_title}");
     println!("output: {}", output.describe());
 
     // Events reach the audio thread through this queue, from the MIDI thread
@@ -272,7 +284,7 @@ fn play(path: &str, o: &Options) -> Result<()> {
     let stream = output.start(processor, Some(from_notes))?;
     let stop = Arc::new(AtomicBool::new(false));
     if seconds.is_none() {
-        println!("press Enter to stop");
+        println!("press Enter, or close the editor, to stop");
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             let _ = std::io::stdin().lock().read_line(&mut String::new());
@@ -280,12 +292,14 @@ fn play(path: &str, o: &Options) -> Result<()> {
         });
     }
 
+    // One turn of the main thread: plays due demo events and answers the
+    // plugin. Returns false when it is time to stop.
     let start = Instant::now();
     let mut demo = demo.into_iter().peekable();
-    loop {
+    let mut tick = |plugin: &mut Plugin| {
         let elapsed = start.elapsed().as_secs_f64();
         if stop.load(Ordering::Acquire) || seconds.is_some_and(|s| elapsed >= s) {
-            break;
+            return false;
         }
         while let Some((_, event)) = demo.next_if(|(t, _)| *t <= elapsed) {
             if let Some(tx) = demo_events.as_mut() {
@@ -293,13 +307,39 @@ fn play(path: &str, o: &Options) -> Result<()> {
             }
         }
         plugin.poll_main_thread();
-        std::thread::sleep(Duration::from_millis(5));
+        true
+    };
+
+    let shown = !o.no_editor && editor::run(&mut plugin, &plugin_title, &mut tick)?;
+    if !o.no_editor && !shown {
+        println!("the plugin has no editor to show");
+    }
+    if !shown {
+        while tick(&mut plugin) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     // The stream owns the plugin's processor. It has to stop before the
     // plugin is destroyed.
     drop(stream);
     drop(plugin);
+    Ok(())
+}
+
+fn editor_only(path: &str, o: &Options) -> Result<()> {
+    // SAFETY: the user asked for this file to be loaded.
+    let mut plugin = unsafe { Plugin::open(Path::new(path), o.id.as_deref()) }?;
+    let title = plugin.describe();
+    println!("{title}");
+    let start = Instant::now();
+    let mut tick = |plugin: &mut Plugin| {
+        plugin.poll_main_thread();
+        o.seconds.is_none_or(|s| start.elapsed().as_secs_f64() < s)
+    };
+    if !editor::run(&mut plugin, &title, &mut tick)? {
+        return Err("the plugin has no editor to show".into());
+    }
     Ok(())
 }
 

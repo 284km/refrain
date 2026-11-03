@@ -16,6 +16,9 @@ refrain is MIT-licensed and depends only on permissively licensed crates.
 | [clack-plugin](https://github.com/prokopyl/clack) | MIT OR Apache-2.0 | The CLAP test plugins only, which are not part of refrain itself |
 | [vst3](https://github.com/coupler-rs/vst3-rs) | MIT OR Apache-2.0 | Bindings to the VST3 API, generated from the MIT-licensed VST3 SDK headers |
 | [libloading](https://github.com/nagisa/rust_libloading) | ISC | Loading VST3 modules |
+| [winit](https://github.com/rust-windowing/winit) | Apache-2.0 | The window that holds a plugin's editor |
+| [raw-window-handle](https://github.com/rust-windowing/raw-window-handle) | MIT OR Apache-2.0 OR Zlib | Passing that window to plugins |
+| [windows-sys](https://github.com/microsoft/windows-rs) | MIT OR Apache-2.0 | Windows only: checking the editor was embedded, and the test plugins' editor |
 
 Their transitive dependencies are listed by `cargo tree` and are all under
 licenses in the allow list of `deny.toml`.

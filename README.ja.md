@@ -6,7 +6,8 @@ macOS と Windows で動く DAW です。Rust で書いています。
 
 > 状態: ごく初期の段階です。CLAP と VST3 のインストゥルメントを読み込み、MIDI 入力から
 > 鳴らせます。サステインペダルとピッチベンドも届きます。音はオーディオデバイスにも、
-> デバイスを使わずに WAV ファイルにも出せます。GUI はまだ無く、`refrain` コマンドだけです。
+> デバイスを使わずに WAV ファイルにも出せます。プラグインの画面はウィンドウで開けます。
+> refrain 自身の GUI はまだ無く、`refrain` コマンドだけです。
 
 ## 目標
 
@@ -24,6 +25,7 @@ crates/
   refrain-test-tone/        テスト用プラグインの音
   refrain-test-synth/       ホスト機能のテストに使う CLAP のプラグイン
   refrain-test-synth-vst3/  同じ音の VST3 のプラグイン
+  refrain-test-editor/      テスト用プラグインの画面。名前を出すだけのパネル
   refrain/                  `refrain` コマンド。オーディオデバイス、MIDI、WAV の出力
 scripts/
   build-test-plugins.sh     テスト用プラグインを .clap と .vst3 のファイルにする
@@ -56,7 +58,10 @@ scripts/build-test-plugins.sh
 cargo run -- play target/test-plugins/refrain-test-synth.clap          # MIDI キーボードから
 cargo run -- play target/test-plugins/refrain-test-synth.vst3 --demo   # 短いフレーズ
 cargo run -- render out.wav --plugin target/test-plugins/refrain-test-synth.vst3
+cargo run -- editor target/test-plugins/refrain-test-synth.clap        # 画面だけを開く
 ```
+
+`play` は、プラグインに画面があればウィンドウで開きます。`--no-editor` を付けると開きません。
 
 インストール済みのインストゥルメントも同じように、`.clap` か `.vst3` のファイル（またはバンドル）を
 渡せば使えます。1 つのファイルに複数のプラグインがあるときは `--id` で選びます（VST3 は名前か

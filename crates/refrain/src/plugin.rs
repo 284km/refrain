@@ -8,6 +8,13 @@ use refrain_vst3::{Vst3Error, Vst3Module, Vst3Plugin};
 
 use crate::Result;
 
+/// The size of an editor: in points on macOS, pixels elsewhere.
+pub struct EditorSize {
+    pub width: u32,
+    pub height: u32,
+    pub resizable: bool,
+}
+
 pub enum Plugin {
     Clap(ClapPlugin),
     Vst3(Vst3Plugin),
@@ -73,6 +80,60 @@ impl Plugin {
             Self::Clap(p) => Box::new(p.activate(sample_rate, max_block_frames)?),
             Self::Vst3(p) => Box::new(p.activate(sample_rate, max_block_frames)?),
         })
+    }
+
+    /// Opens the plugin's editor inside `parent`. Sizes are in points on
+    /// macOS and pixels elsewhere. `None` when there is no editor to embed.
+    ///
+    /// # Safety
+    ///
+    /// `parent` must stay valid until the editor is closed.
+    pub unsafe fn open_editor(
+        &mut self,
+        parent: winit::raw_window_handle::RawWindowHandle,
+        scale: f64,
+    ) -> Result<Option<EditorSize>> {
+        Ok(match self {
+            Self::Clap(p) => unsafe { p.open_editor(parent, scale) }?.map(|s| EditorSize {
+                width: s.width,
+                height: s.height,
+                resizable: s.resizable,
+            }),
+            Self::Vst3(p) => unsafe { p.open_editor(parent, scale) }?.map(|s| EditorSize {
+                width: s.width,
+                height: s.height,
+                resizable: s.resizable,
+            }),
+        })
+    }
+
+    pub fn resize_editor(&mut self, width: u32, height: u32) -> (u32, u32) {
+        match self {
+            Self::Clap(p) => p.resize_editor(width, height),
+            Self::Vst3(p) => p.resize_editor(width, height),
+        }
+    }
+
+    pub fn take_editor_resize_request(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Clap(p) => p.take_editor_resize_request(),
+            Self::Vst3(p) => p.take_editor_resize_request(),
+        }
+    }
+
+    /// Whether the plugin closed its own editor.
+    pub fn editor_closed(&self) -> bool {
+        match self {
+            Self::Clap(p) => p.editor_closed(),
+            Self::Vst3(_) => false,
+        }
+    }
+
+    pub fn close_editor(&mut self) {
+        match self {
+            Self::Clap(p) => p.close_editor(),
+            Self::Vst3(p) => p.close_editor(),
+        }
     }
 
     /// Answers the plugin's requests for the main thread.

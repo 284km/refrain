@@ -13,4 +13,5 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 refrain-test-tone = { path = "../refrain-test-tone" }
+refrain-test-editor = { path = "../refrain-test-editor" }
 vst3 = "0.3"

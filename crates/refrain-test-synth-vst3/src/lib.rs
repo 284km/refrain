@@ -25,7 +25,7 @@ use std::slice;
 use refrain_test_tone::Tone;
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
-use vst3::{Class, ComRef, ComWrapper, uid};
+use vst3::{Class, ComPtr, ComRef, ComWrapper, uid};
 
 pub use refrain_test_tone::{BEND_SEMITONES, FADE_SECONDS, PEAK, RIGHT_GAIN, key_frequency};
 
@@ -49,6 +49,28 @@ pub mod params {
 }
 
 const MAX_CHANGES: usize = 4096;
+
+thread_local! {
+    // The component handlers of this thread's controllers, for
+    // `edit_from_editor`. Tests run on threads of their own, so each sees
+    // only the plugins it made.
+    static HANDLERS: RefCell<Vec<ComPtr<IComponentHandler>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Does what turning a knob in the plugin's editor does: tells the host,
+/// through its component handler, that parameter `id` changed to `value`.
+/// Reaches the controllers created on this thread. For tests.
+pub fn edit_from_editor(id: ParamID, value: f64) {
+    HANDLERS.with_borrow(|handlers| {
+        for h in handlers {
+            unsafe {
+                h.beginEdit(id);
+                h.performEdit(id, value);
+                h.endEdit(id);
+            }
+        }
+    });
+}
 
 fn copy_cstring(src: &str, dst: &mut [c_char]) {
     let c_string = CString::new(src).unwrap_or_default();
@@ -432,6 +454,7 @@ impl IProcessContextRequirementsTrait for SynthProcessor {
 struct SynthController {
     kind: Kind,
     values: [Cell<f64>; 3],
+    handler: RefCell<Option<ComPtr<IComponentHandler>>>,
 }
 
 impl Class for SynthController {
@@ -443,6 +466,7 @@ impl SynthController {
         Self {
             kind,
             values: [Cell::new(0.0), Cell::new(8192.0 / 16383.0), Cell::new(0.0)],
+            handler: RefCell::new(None),
         }
     }
 
@@ -536,12 +560,28 @@ impl IEditControllerTrait for SynthController {
         }
     }
 
-    unsafe fn setComponentHandler(&self, _handler: *mut IComponentHandler) -> tresult {
+    unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
+        let new = unsafe { ComRef::from_raw(handler) }.map(|h| h.to_com_ptr());
+        let old = self.handler.replace(new.clone());
+        HANDLERS.with_borrow_mut(|handlers| {
+            if let Some(old) = old {
+                handlers.retain(|h| h.as_ptr() != old.as_ptr());
+            }
+            handlers.extend(new);
+        });
         kResultOk
     }
 
-    unsafe fn createView(&self, _name: FIDString) -> *mut IPlugView {
-        ptr::null_mut()
+    unsafe fn createView(&self, name: FIDString) -> *mut IPlugView {
+        if name.is_null() || unsafe { std::ffi::CStr::from_ptr(name) } != c"editor" {
+            return ptr::null_mut();
+        }
+        ComWrapper::new(SynthView {
+            title: self.kind.name(),
+            panel: RefCell::new(None),
+        })
+        .to_com_ptr::<IPlugView>()
+        .map_or(ptr::null_mut(), |v| v.into_raw())
     }
 }
 
@@ -564,6 +604,98 @@ impl IMidiMappingTrait for SynthController {
         };
         unsafe { *id = param };
         kResultTrue
+    }
+}
+
+/// The editor: a panel with the plugin's name, embedded in the host's window.
+struct SynthView {
+    title: &'static str,
+    panel: RefCell<Option<refrain_test_editor::Panel>>,
+}
+
+impl Class for SynthView {
+    type Interfaces = (IPlugView,);
+}
+
+/// The window type this platform's editor embeds in.
+const PLATFORM: &std::ffi::CStr = if cfg!(target_os = "macos") {
+    c"NSView"
+} else {
+    c"HWND"
+};
+
+impl IPlugViewTrait for SynthView {
+    unsafe fn isPlatformTypeSupported(&self, kind: FIDString) -> tresult {
+        if !kind.is_null() && unsafe { std::ffi::CStr::from_ptr(kind) } == PLATFORM {
+            kResultTrue
+        } else {
+            kResultFalse
+        }
+    }
+
+    unsafe fn attached(&self, parent: *mut c_void, kind: FIDString) -> tresult {
+        if unsafe { self.isPlatformTypeSupported(kind) } != kResultTrue {
+            return kResultFalse;
+        }
+        // SAFETY: the host gives a live window and calls this on the main
+        // thread.
+        match unsafe { refrain_test_editor::Panel::attach(parent, self.title) } {
+            Some(panel) => {
+                *self.panel.borrow_mut() = Some(panel);
+                kResultOk
+            }
+            None => kResultFalse,
+        }
+    }
+
+    unsafe fn removed(&self) -> tresult {
+        self.panel.take();
+        kResultOk
+    }
+
+    unsafe fn onWheel(&self, _distance: f32) -> tresult {
+        kResultFalse
+    }
+
+    unsafe fn onKeyDown(&self, _key: char16, _code: int16, _modifiers: int16) -> tresult {
+        kResultFalse
+    }
+
+    unsafe fn onKeyUp(&self, _key: char16, _code: int16, _modifiers: int16) -> tresult {
+        kResultFalse
+    }
+
+    unsafe fn getSize(&self, size: *mut ViewRect) -> tresult {
+        let Some(size) = (unsafe { size.as_mut() }) else {
+            return kInvalidArgument;
+        };
+        *size = ViewRect {
+            left: 0,
+            top: 0,
+            right: refrain_test_editor::WIDTH as i32,
+            bottom: refrain_test_editor::HEIGHT as i32,
+        };
+        kResultOk
+    }
+
+    unsafe fn onSize(&self, _size: *mut ViewRect) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn onFocus(&self, _state: TBool) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn setFrame(&self, _frame: *mut IPlugFrame) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn canResize(&self) -> tresult {
+        kResultFalse
+    }
+
+    unsafe fn checkSizeConstraint(&self, rect: *mut ViewRect) -> tresult {
+        unsafe { self.getSize(rect) }
     }
 }
 

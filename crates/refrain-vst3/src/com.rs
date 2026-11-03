@@ -9,6 +9,7 @@
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::Mutex;
 
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
@@ -46,8 +47,19 @@ impl IHostApplicationTrait for HostApplication {
     }
 }
 
-/// Receives edits the plugin makes to its own parameters. Ignored for now.
-pub struct ComponentHandler;
+/// Receives edits the plugin makes to its own parameters, such as a knob
+/// turned in its editor, and passes them to the audio thread.
+#[derive(Default)]
+pub struct ComponentHandler {
+    edits: Mutex<Option<rtrb::Producer<(ParamID, ParamValue)>>>,
+}
+
+impl ComponentHandler {
+    /// Where edits go from now on. Until this is set, they are dropped.
+    pub fn send_edits_to(&self, producer: rtrb::Producer<(ParamID, ParamValue)>) {
+        *self.edits.lock().unwrap() = Some(producer);
+    }
+}
 
 impl Class for ComponentHandler {
     type Interfaces = (IComponentHandler,);
@@ -58,7 +70,11 @@ impl IComponentHandlerTrait for ComponentHandler {
         kResultOk
     }
 
-    unsafe fn performEdit(&self, _id: ParamID, _value: ParamValue) -> tresult {
+    unsafe fn performEdit(&self, id: ParamID, value: ParamValue) -> tresult {
+        if let Some(edits) = self.edits.lock().unwrap().as_mut() {
+            // A full queue drops the edit rather than blocking the editor.
+            let _ = edits.push((id, value));
+        }
         kResultOk
     }
 
@@ -68,6 +84,38 @@ impl IComponentHandlerTrait for ComponentHandler {
 
     unsafe fn restartComponent(&self, _flags: int32) -> tresult {
         kResultOk
+    }
+}
+
+/// Where a plugin's editor asks for its window to change size.
+#[derive(Default)]
+pub struct PlugFrame {
+    requested: Cell<Option<(u32, u32)>>,
+}
+
+impl Class for PlugFrame {
+    type Interfaces = (IPlugFrame,);
+}
+
+impl PlugFrame {
+    pub fn take_request(&self) -> Option<(u32, u32)> {
+        self.requested.take()
+    }
+}
+
+impl IPlugFrameTrait for PlugFrame {
+    unsafe fn resizeView(&self, _view: *mut IPlugView, size: *mut ViewRect) -> tresult {
+        let Some(r) = (unsafe { size.as_ref() }) else {
+            return kInvalidArgument;
+        };
+        let (w, h) = (
+            (r.right - r.left).max(1) as u32,
+            (r.bottom - r.top).max(1) as u32,
+        );
+        // The window is resized on the main loop's next turn, and the view is
+        // then told its new size through onSize.
+        self.requested.set(Some((w, h)));
+        kResultTrue
     }
 }
 

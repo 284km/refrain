@@ -41,6 +41,20 @@ jobs:
           cargo run -- render target/vst3.wav --plugin $p/refrain-test-synth.vst3
           cargo run -- render target/vst3-notes.wav --plugin $p/refrain-test-synth.vst3 --id "refrain test synth (notes only)"
           for f in clap-notes vst3 vst3-notes; do cmp target/clap.wav target/$f.wav; done
+      # Open each test plugin's editor in a real window, and check it ended up
+      # inside that window.
+      - name: Open the test plugins' editors
+        shell: bash
+        run: |
+          p=target/test-plugins
+          check_editor() {
+            cargo run -- editor "$@" --seconds 1 | tee target/editor.log
+            grep -q "editor: 400 x 300, embedded" target/editor.log
+          }
+          check_editor $p/refrain-test-synth.clap
+          check_editor $p/refrain-test-synth.clap --id dev.refrain.test-synth.notes-only
+          check_editor $p/refrain-test-synth.vst3
+          check_editor $p/refrain-test-synth.vst3 --id "refrain test synth (notes only)"
 
   licenses:
     runs-on: ubuntu-latest

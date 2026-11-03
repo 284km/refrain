@@ -9,8 +9,8 @@ heard or checked on both macOS and Windows.
 | 2 | Load a CLAP or VST3 instrument and play it from a MIDI keyboard | Done. Checked on a macOS device and through a virtual MIDI port; not yet with a hardware keyboard or on a Windows device |
 | 2a | Sustain pedal, pitch bend and other controllers | Done. Plugins that take notes only get the pedal played for them |
 | 2b | VST3 instruments | Done. Test plugins agree with the CLAP ones sample for sample; a commercial VST3 instrument loads, renders and plays on a macOS device |
-| 3 | Open a plugin's editor in a window | Next |
-| 4 | Save and restore plugin state with a project | |
+| 3 | Open a plugin's editor in a window | Done. CLAP and VST3; the test plugins' editors open in CI on macOS and Windows, and a commercial VST3 editor opens on macOS |
+| 4 | Save and restore plugin state with a project | Next |
 | 5 | Record and play back MIDI clips on a timeline | |
 | 6 | Effect chains and a mixer | |
 | 7 | Render a project to a WAV file | |

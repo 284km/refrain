@@ -90,6 +90,26 @@ bindings.
 - As with CLAP, the stream has to stop before the `Vst3Plugin` is dropped;
   otherwise the plugin is leaked rather than torn down under the audio thread.
 
+### Plugin editors
+
+`refrain play` and `refrain editor` open a plugin's editor in a window made
+with [`winit`](https://github.com/rust-windowing/winit), on the main thread.
+The plugin embeds its editor in the window's `NSView` (macOS) or `HWND`
+(Windows): through the CLAP `gui` extension, or a VST3 `IPlugView`. Editor
+sizes are in points on macOS and pixels on Windows, in both formats.
+
+- When the plugin asks for a new size (CLAP `request_resize`, VST3
+  `IPlugFrame::resizeView`), the window is resized on the next turn of the
+  main loop and the plugin is told the size it got.
+- A VST3 plugin reports edits made in its editor through the component
+  handler. refrain passes them to the processor through a lock-free queue,
+  and they take effect at the start of the next block. CLAP plugins apply
+  their own edits.
+- After opening, refrain checks that the window gained a child view or
+  window, and says so: a plugin that accepts the window but puts nothing in
+  it would otherwise show an empty window without explanation.
+- The editor is closed before the window it lives in, and before the plugin.
+
 ### Test plugins
 
 `refrain-test-tone` is a small sine synth. `refrain-test-synth` (CLAP) and
@@ -105,6 +125,11 @@ MIDI, the VST3 one as parameters it maps through `IMidiMapping`. The other
 takes notes only, so refrain plays the pedal for it. Tests send all four the
 same events and require the same samples. That checks refrain's pedal against
 the plugins' own, and the CLAP host and the VST3 host against each other.
+
+They have an editor too, from `refrain-test-editor`: a fixed 400 × 300 panel
+with the plugin's name, added as a child of the host's window. It checks that
+it really became a child, and fails otherwise, so a host that passes the wrong
+window cannot pass the editor check in CI.
 
 `scripts/build-test-plugins.sh` packages them the way plugins are installed,
 as bundles on macOS and single files on Windows, for CI and for trying them.
@@ -135,9 +160,11 @@ the device's sample type.
   not send them yet.
 - **Plugin logs** are printed from whichever thread logs, which can be the
   audio thread.
-- **VST3 plugins' own edits are ignored.** When a plugin changes a parameter
-  itself, refrain does not pass the change from the controller to the
-  processor. This matters once plugin editors open, in step 3.
+- **Editors are embedded only.** CLAP plugins whose editor can only float in a
+  window of its own are not supported yet, and neither is the CLAP timer
+  extension, which some plugins use to redraw on Linux.
+- **Moving an editor's window between screens of different scale** does not
+  tell the plugin about the new scale yet.
 - **VST3 messages.** refrain does not create `IMessage` objects for plugins.
   The component and controller talk through their connection points directly,
   which is enough for the plugins tried so far.
@@ -161,7 +188,9 @@ device:
   when it is struck again, ignoring All Notes Off, and treating a pedal value
   of 64 as up. For VST3: not sending mapped controllers, dropping the sample
   offsets of notes or of parameter changes, normalizing pitch bend over 16384,
-  and never reading the MIDI mapping. Each one fails a test. One of them first passed, because the
+  and never reading the MIDI mapping, and dropping edits made in the editor.
+  Each one fails a test. For editors, the host was made to skip handing the
+  plugin its window; the check that the window gained a child caught it. One of them first passed, because the
   test synth hid the host's mistake; the synth was changed so it no longer
   does.
 
