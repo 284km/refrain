@@ -41,6 +41,19 @@ jobs:
           cargo run -- render target/vst3.wav --plugin $p/refrain-test-synth.vst3
           cargo run -- render target/vst3-notes.wav --plugin $p/refrain-test-synth.vst3 --id "refrain test synth (notes only)"
           for f in clap-notes vst3 vst3-notes; do cmp target/clap.wav target/$f.wav; done
+      # Projects saved with the volume at half bring the plugins back at half,
+      # in both formats, and saving them again changes nothing.
+      - name: Restore and save projects
+        shell: bash
+        run: |
+          for f in clap vst3; do
+            cargo run -- render target/half-$f.wav --plugin tests/projects/half-volume-$f.refrain | tee target/project.log
+            grep -Eq "peak 0\.29" target/project.log
+            cargo run -- editor tests/projects/half-volume-$f.refrain --seconds 1 --save target/resaved-$f.refrain
+            cargo run -- render target/resaved-$f.wav --plugin target/resaved-$f.refrain
+            cmp target/half-$f.wav target/resaved-$f.wav
+          done
+          cmp target/half-clap.wav target/half-vst3.wav
       # Open each test plugin's editor in a real window, and check it ended up
       # inside that window.
       - name: Open the test plugins' editors

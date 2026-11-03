@@ -1,0 +1,13 @@
+{
+  "refrain": 1,
+  "instrument": {
+    "format": "vst3",
+    "path": "../../target/test-plugins/refrain-test-synth.vst3",
+    "id": "7E5C0A312B9D4F1A9C3E6D521F0A8B44",
+    "name": "refrain test synth",
+    "state": {
+      "data": "cnRzMQAAAD8=",
+      "controller": ""
+    }
+  }
+}

@@ -26,6 +26,7 @@ crates/
   refrain-test-synth/       ホスト機能のテストに使う CLAP のプラグイン
   refrain-test-synth-vst3/  同じ音の VST3 のプラグイン
   refrain-test-editor/      テスト用プラグインの画面。名前を出すだけのパネル
+  refrain-project/          プロジェクトファイル。使うプラグインとその状態
   refrain/                  `refrain` コマンド。オーディオデバイス、MIDI、WAV の出力
 scripts/
   build-test-plugins.sh     テスト用プラグインを .clap と .vst3 のファイルにする
@@ -62,6 +63,18 @@ cargo run -- editor target/test-plugins/refrain-test-synth.clap        # 画面�
 ```
 
 `play` は、プラグインに画面があればウィンドウで開きます。`--no-editor` を付けると開きません。
+
+音色を残しておくには、画面を閉じるときに、プラグインとその状態をプロジェクトとして保存します。
+次からは、プラグインの代わりにプロジェクトを開きます。
+
+```sh
+cargo run -- play target/test-plugins/refrain-test-synth.vst3 --save song.refrain
+cargo run -- play song.refrain                        # 同じプラグイン、同じ音
+cargo run -- render out.wav --plugin song.refrain
+```
+
+プロジェクトは小さな JSON のファイルです。中のプラグインのパスが相対パスなら、プロジェクトの
+フォルダからの相対パスです。
 
 インストール済みのインストゥルメントも同じように、`.clap` か `.vst3` のファイル（またはバンドル）を
 渡せば使えます。1 つのファイルに複数のプラグインがあるときは `--id` で選びます（VST3 は名前か

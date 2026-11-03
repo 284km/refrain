@@ -13,7 +13,8 @@ use crate::Vst3Error;
 #[derive(Clone, Debug)]
 pub struct Vst3Info {
     pub name: String,
-    /// The class ID, in hex. Unique, unlike the name.
+    /// The class ID, in hex. Unique, unlike the name, and the same on every
+    /// platform, as the VST3 SDK prints it.
     pub id: String,
     pub vendor: String,
     pub version: String,
@@ -183,11 +184,7 @@ impl Vst3Module {
             }
             let mut plugin = Vst3Info {
                 name: text(&info.name),
-                id: info
-                    .cid
-                    .iter()
-                    .map(|b| format!("{:02X}", *b as u8))
-                    .collect(),
+                id: class_id(&info.cid),
                 vendor: vendor.clone(),
                 version: String::new(),
                 categories: String::new(),
@@ -221,6 +218,24 @@ impl Vst3Module {
         }
         unsafe { ComPtr::from_raw(obj as *mut I) }
     }
+}
+
+/// A class ID as text. On Windows, class IDs are laid out as COM GUIDs, with
+/// the first eight bytes in a different order; this undoes that, so the text
+/// is the same everywhere.
+pub(crate) fn class_id(cid: &TUID) -> String {
+    let b: [u8; 16] = cid.map(|c| c as u8);
+    let be = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    let (first, second) = if cfg!(target_os = "windows") {
+        let le16 = |i: usize| u32::from(u16::from_le_bytes([b[i], b[i + 1]]));
+        (
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            le16(4) << 16 | le16(6),
+        )
+    } else {
+        (be(0), be(4))
+    };
+    format!("{first:08X}{second:08X}{:08X}{:08X}", be(8), be(12))
 }
 
 /// The file to load for a `.vst3` path.
@@ -390,6 +405,12 @@ mod mac {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn class_ids_read_the_same_on_every_platform() {
+        let cid = vst3::uid(0x7E5C0A31, 0x2B9D4F1A, 0x9C3E6D52, 0x1F0A8B44);
+        assert_eq!(class_id(&cid), "7E5C0A312B9D4F1A9C3E6D521F0A8B44");
+    }
 
     #[test]
     fn reads_the_executable_from_info_plist() {

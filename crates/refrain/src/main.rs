@@ -31,7 +31,8 @@ usage:
   refrain plugins                       list installed CLAP and VST3 plugins
   refrain sine [options]                play a sine wave
   refrain play <plugin> [options]       play a .clap or .vst3 instrument from MIDI,
-                                        with its editor open
+                                        with its editor open. A .refrain project
+                                        works too, here and below
   refrain editor <plugin> [options]     open a plugin's editor, without audio
   refrain render <out.wav> [options]    write a sine wave, or a plugin playing
                                         a short phrase with --plugin, to a WAV file
@@ -43,6 +44,8 @@ options:
   --plugin <path>    render through this .clap or .vst3 plugin
   --demo             play the short phrase instead of reading MIDI (play)
   --no-editor        do not open the plugin's editor (play)
+  --save <project>   when done, save the plugin and its state as a project
+                     (play, editor)
   --seconds <s>      length (default 2; play and editor run until closed without it)
   --freq <hz>        sine frequency (default 440)
   --amp <0..1>       sine amplitude (default 0.2)
@@ -87,6 +90,7 @@ struct Options {
     midi: Option<String>,
     id: Option<String>,
     plugin: Option<String>,
+    save: Option<String>,
     demo: bool,
     no_editor: bool,
     seconds: Option<f64>,
@@ -103,6 +107,7 @@ impl Options {
             midi: None,
             id: None,
             plugin: None,
+            save: None,
             demo: false,
             no_editor: false,
             seconds: None,
@@ -127,6 +132,7 @@ impl Options {
                 "--midi" => o.midi = Some(value.clone()),
                 "--id" => o.id = Some(value.clone()),
                 "--plugin" => o.plugin = Some(value.clone()),
+                "--save" => o.save = Some(value.clone()),
                 "--seconds" => o.seconds = Some(value.parse()?),
                 "--freq" => o.freq = value.parse()?,
                 "--amp" => o.amp = value.parse()?,
@@ -320,6 +326,11 @@ fn play(path: &str, o: &Options) -> Result<()> {
         }
     }
 
+    if let Some(project) = &o.save {
+        plugin.save_project(Path::new(project))?;
+        println!("saved {project}");
+    }
+
     // The stream owns the plugin's processor. It has to stop before the
     // plugin is destroyed.
     drop(stream);
@@ -339,6 +350,10 @@ fn editor_only(path: &str, o: &Options) -> Result<()> {
     };
     if !editor::run(&mut plugin, &title, &mut tick)? {
         return Err("the plugin has no editor to show".into());
+    }
+    if let Some(project) = &o.save {
+        plugin.save_project(Path::new(project))?;
+        println!("saved {project}");
     }
     Ok(())
 }

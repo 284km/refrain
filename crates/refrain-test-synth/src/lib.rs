@@ -7,12 +7,16 @@
 //! The file holds two plugins that sound the same:
 //!
 //! - [`ID`] takes CLAP notes and MIDI. It plays the sustain pedal, pitch bend
-//!   (two semitones each way) and All Notes Off itself.
+//!   (two semitones each way), All Notes Off and volume (controller 7) itself.
 //! - [`NOTES_ONLY_ID`] takes CLAP notes and nothing else, so the host has to
 //!   play the sustain pedal for it.
+//!
+//! Both save their volume as their state.
 
 use std::cell::RefCell;
 use std::ffi::CStr;
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use clack_extensions::audio_ports::{
     AudioPortFlags, AudioPortInfo, AudioPortInfoWriter, AudioPortType, PluginAudioPorts,
@@ -25,10 +29,12 @@ use clack_extensions::note_ports::{
     NoteDialect, NoteDialects, NotePortInfo, NotePortInfoWriter, PluginNotePorts,
     PluginNotePortsImpl,
 };
+use clack_extensions::state::{PluginState, PluginStateImpl};
 use clack_plugin::entry::prelude::*;
 use clack_plugin::events::Match;
 use clack_plugin::events::spaces::CoreEventSpace;
 use clack_plugin::prelude::*;
+use clack_plugin::stream::{InputStream, OutputStream};
 
 /// The plugin that takes MIDI as well as notes.
 pub const ID: &str = "dev.refrain.test-synth";
@@ -37,7 +43,9 @@ pub const ID: &str = "dev.refrain.test-synth";
 pub const NOTES_ONLY_ID: &str = "dev.refrain.test-synth.notes-only";
 
 use refrain_test_tone::Tone;
-pub use refrain_test_tone::{BEND_SEMITONES, FADE_SECONDS, PEAK, RIGHT_GAIN, key_frequency};
+pub use refrain_test_tone::{
+    BEND_SEMITONES, FADE_SECONDS, PEAK, RIGHT_GAIN, VOLUME_CONTROLLER, key_frequency,
+};
 
 pub struct TestSynth;
 
@@ -50,13 +58,17 @@ impl Plugin for TestSynth {
         builder
             .register::<PluginAudioPorts>()
             .register::<PluginNotePorts>()
-            .register::<PluginGui>();
+            .register::<PluginGui>()
+            .register::<PluginState>();
     }
 }
 
 /// What differs between the two plugins.
 pub struct SynthShared {
     takes_midi: bool,
+    // The volume, as f32 bits: set by the audio thread from MIDI and by the
+    // main thread from a saved state.
+    volume: AtomicU32,
 }
 
 impl PluginShared<'_> for SynthShared {}
@@ -125,7 +137,12 @@ impl PluginFactoryImpl for Factory {
         Some(PluginInstance::new::<TestSynth>(
             host_info,
             descriptor,
-            move |_host| Ok(SynthShared { takes_midi }),
+            move |_host| {
+                Ok(SynthShared {
+                    takes_midi,
+                    volume: AtomicU32::new(1f32.to_bits()),
+                })
+            },
             |_host, shared| {
                 Ok(SynthMainThread {
                     shared,
@@ -159,7 +176,11 @@ impl SynthProcessor<'_> {
             Some(CoreEventSpace::NoteChoke(e)) => {
                 self.tone.choke(specific(e.channel()), specific(e.key()));
             }
-            Some(CoreEventSpace::Midi(e)) if self.shared.takes_midi => self.tone.midi(e.data()),
+            Some(CoreEventSpace::Midi(e)) if self.shared.takes_midi => {
+                self.tone.midi(e.data());
+                let volume = self.tone.volume().to_bits();
+                self.shared.volume.store(volume, Ordering::Relaxed);
+            }
             _ => {}
         }
     }
@@ -196,6 +217,9 @@ impl<'a> PluginAudioProcessor<'a, SynthShared, SynthMainThread<'a>> for SynthPro
             .ok_or(PluginError::Message("expected an output channel"))?;
         left.fill(0.0);
 
+        // A state may have been loaded since the last block.
+        let volume = f32::from_bits(self.shared.volume.load(Ordering::Relaxed));
+        self.tone.set_volume(volume);
         for batch in events.input.batch() {
             for event in batch.events() {
                 self.handle(event);
@@ -329,6 +353,29 @@ impl PluginGuiImpl for SynthMainThread<'_> {
     }
 
     fn hide(&self) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+/// The saved state: the volume, in the format shared with the VST3 plugins.
+impl PluginStateImpl for SynthMainThread<'_> {
+    fn save(&self, output: &mut OutputStream) -> Result<(), PluginError> {
+        let volume = f32::from_bits(self.shared.volume.load(Ordering::Relaxed));
+        output
+            .write_all(&refrain_test_tone::save_state(volume))
+            .map_err(|_| PluginError::Message("could not write the state"))
+    }
+
+    fn load(&self, input: &mut InputStream) -> Result<(), PluginError> {
+        let mut state = Vec::new();
+        input
+            .read_to_end(&mut state)
+            .map_err(|_| PluginError::Message("could not read the state"))?;
+        let volume = refrain_test_tone::load_state(&state)
+            .ok_or(PluginError::Message("not a state of this plugin"))?;
+        self.shared
+            .volume
+            .store(volume.to_bits(), Ordering::Relaxed);
         Ok(())
     }
 }

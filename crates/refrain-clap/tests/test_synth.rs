@@ -307,3 +307,58 @@ fn a_notes_only_plugin_ignores_pitch_bend() {
     let plain = render(NOTES_ONLY_ID, 128, &[on(0.1, 69, 1.0), off(0.7, 69)]);
     assert_eq!(bent, plain);
 }
+
+/// Renders through a fresh plugin, after loading `state` if given, and
+/// returns the output and the plugin's state afterwards.
+fn render_with_state(id: &str, state: Option<&[u8]>, events: &[TimedEvent]) -> (Vec<f32>, Vec<u8>) {
+    let entry = entry();
+    let mut plugin = ClapPlugin::new(&entry, Some(id)).unwrap();
+    if let Some(state) = state {
+        plugin.load_state(state).unwrap();
+    }
+    let mut processor = plugin.activate(RATE, 1_024).unwrap();
+    let out = render_offline(&mut processor, RATE, 2, FRAMES, 128, events);
+    drop(processor);
+    let saved = plugin
+        .save_state()
+        .unwrap()
+        .expect("the test plugins keep state");
+    (out, saved)
+}
+
+#[test]
+fn a_saved_state_brings_the_sound_back() {
+    use refrain_test_synth::VOLUME_CONTROLLER;
+    // Turn the volume down with controller 7, then save.
+    let mut turned_down = vec![cc(0.0, VOLUME_CONTROLLER, 64)];
+    turned_down.extend(a4(1.0));
+    let (quieter, saved) = render_with_state(ID, None, &turned_down);
+    assert_eq!(saved, refrain_test_tone::save_state(64.0 / 127.0));
+
+    // A fresh plugin with that state sounds the same without the controller.
+    let (restored, resaved) = render_with_state(ID, Some(&saved), &a4(1.0));
+    assert_eq!(restored, quieter);
+    assert_eq!(resaved, saved);
+
+    let (default, _) = render_with_state(ID, None, &a4(1.0));
+    assert_ne!(restored, default);
+}
+
+#[test]
+fn a_notes_only_plugin_restores_its_state_too() {
+    let half = refrain_test_tone::save_state(0.5);
+    let (restored, resaved) = render_with_state(NOTES_ONLY_ID, Some(&half), &a4(1.0));
+    let (default, _) = render_with_state(NOTES_ONLY_ID, None, &a4(1.0));
+    for (r, d) in restored.iter().zip(&default) {
+        assert_eq!(*r, *d * 0.5);
+    }
+    assert_eq!(resaved, half);
+}
+
+#[test]
+fn a_broken_state_is_refused() {
+    let entry = entry();
+    let mut plugin = ClapPlugin::new(&entry, Some(ID)).unwrap();
+    let err = plugin.load_state(b"not a state").unwrap_err();
+    assert!(matches!(err, ClapError::State(_)), "{err}");
+}

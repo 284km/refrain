@@ -15,6 +15,7 @@ raw-window-handle = "0.6"
 rtrb = "0.4"
 
 [dev-dependencies]
+refrain-test-tone = { path = "../refrain-test-tone" }
 refrain-test-synth-vst3 = { path = "../refrain-test-synth-vst3" }
 refrain-clap = { path = "../refrain-clap" }
 refrain-test-synth = { path = "../refrain-test-synth" }

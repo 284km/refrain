@@ -26,6 +26,7 @@ use clack_extensions::note_ports::{NoteDialects, NotePortInfoBuffer, PluginNoteP
 use clack_extensions::params::{
     HostParams, HostParamsImplMainThread, HostParamsImplShared, ParamClearFlags, ParamRescanFlags,
 };
+use clack_extensions::state::{HostState, HostStateImpl, PluginState};
 use clack_host::events::event_types::{MidiEvent, NoteOffEvent, NoteOnEvent};
 use clack_host::events::{Event as _, EventFlags, Match};
 use clack_host::prelude::*;
@@ -69,6 +70,8 @@ pub enum ClapError {
     NoAudioOutput,
     /// Opening the editor failed at the named step.
     Editor(&'static str),
+    /// Saving or loading the plugin's state failed.
+    State(&'static str),
     Instance(PluginInstanceError),
 }
 
@@ -86,6 +89,7 @@ impl fmt::Display for ClapError {
             Self::NotFound(id) => write!(f, "the CLAP file holds no plugin with id {id}"),
             Self::NoAudioOutput => f.write_str("the plugin has no audio output"),
             Self::Editor(step) => write!(f, "the plugin's editor failed to {step}"),
+            Self::State(step) => write!(f, "the plugin's state failed to {step}"),
             Self::Instance(e) => write!(f, "{e}"),
         }
     }
@@ -202,7 +206,8 @@ impl HostHandlers for RefrainHost {
         builder
             .register::<HostLog>()
             .register::<HostParams>()
-            .register::<HostGui>();
+            .register::<HostGui>()
+            .register::<HostState>();
     }
 }
 
@@ -270,6 +275,12 @@ pub struct HostMainThread;
 
 impl MainThreadHandler<'_> for HostMainThread {}
 
+impl HostStateImpl for HostMainThread {
+    fn mark_dirty(&self) {
+        // refrain saves when asked to, not when the plugin changes.
+    }
+}
+
 impl HostParamsImplMainThread for HostMainThread {
     fn rescan(&self, _flags: ParamRescanFlags) {}
 
@@ -327,6 +338,31 @@ impl ClapPlugin {
             instance,
             info,
         })
+    }
+
+    /// The plugin's state, as bytes only the plugin understands. `None` when
+    /// the plugin keeps no state.
+    pub fn save_state(&mut self) -> Result<Option<Vec<u8>>, ClapError> {
+        let handle = self.instance.plugin_handle();
+        let Some(state) = handle.get_extension::<PluginState>() else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        state
+            .save(&handle, &mut bytes)
+            .map_err(|_| ClapError::State("save"))?;
+        Ok(Some(bytes))
+    }
+
+    /// Restores a state from [`save_state`](Self::save_state).
+    pub fn load_state(&mut self, bytes: &[u8]) -> Result<(), ClapError> {
+        let handle = self.instance.plugin_handle();
+        let state = handle
+            .get_extension::<PluginState>()
+            .ok_or(ClapError::State("load: the plugin keeps no state"))?;
+        state
+            .load(&handle, &mut &bytes[..])
+            .map_err(|_| ClapError::State("load"))
     }
 
     /// Opens the plugin's editor inside `parent`, at the window's `scale`.

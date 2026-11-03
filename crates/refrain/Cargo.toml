@@ -11,6 +11,7 @@ publish.workspace = true
 refrain-engine.workspace = true
 refrain-clap = { path = "../refrain-clap" }
 refrain-vst3 = { path = "../refrain-vst3" }
+refrain-project = { path = "../refrain-project" }
 cpal = "0.18"
 hound = "3.5"
 midir = "0.11"

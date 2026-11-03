@@ -45,6 +45,8 @@ pub enum Vst3Error {
     Call(&'static str),
     /// Opening the editor failed at the named step.
     Editor(&'static str),
+    /// Saving or loading the plugin's state failed.
+    State(&'static str),
     NoAudioOutput,
 }
 
@@ -61,6 +63,7 @@ impl fmt::Display for Vst3Error {
             Self::NotFound(name) => write!(f, "the VST3 module holds no plugin named {name}"),
             Self::Call(call) => write!(f, "the plugin failed {call}"),
             Self::Editor(step) => write!(f, "the plugin's editor failed to {step}"),
+            Self::State(step) => write!(f, "the plugin's state failed to {step}"),
             Self::NoAudioOutput => f.write_str("the plugin has no audio output"),
         }
     }
@@ -74,6 +77,14 @@ fn check(result: tresult, call: &'static str) -> Result<(), Vst3Error> {
     } else {
         Err(Vst3Error::Call(call))
     }
+}
+
+/// A VST3 plugin's state: its component's and its controller's, each as
+/// bytes only the plugin understands.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Vst3State {
+    pub component: Vec<u8>,
+    pub controller: Vec<u8>,
 }
 
 /// The size of a plugin's editor: in points on macOS, pixels elsewhere.
@@ -99,6 +110,9 @@ pub struct Vst3Plugin {
     component: ComPtr<IComponent>,
     processor: ComPtr<IAudioProcessor>,
     controller: Option<ComPtr<IEditController>>,
+    // Whether the controller is an object of its own, rather than the
+    // component itself.
+    separate_controller: bool,
     connection: Option<(ComPtr<IConnectionPoint>, ComPtr<IConnectionPoint>)>,
     _host: ComWrapper<HostApplication>,
     _handler: ComWrapper<ComponentHandler>,
@@ -168,6 +182,7 @@ impl Vst3Plugin {
             component,
             processor,
             controller,
+            separate_controller: separate,
             connection: None,
             _host: host,
             info,
@@ -290,6 +305,55 @@ impl Vst3Plugin {
             self.module.clone(),
             edits,
         ))
+    }
+
+    /// The plugin's state, as bytes only the plugin understands.
+    pub fn save_state(&mut self) -> Result<Vst3State, Vst3Error> {
+        let stream = ComWrapper::new(MemoryStream::default());
+        let s = stream.as_com_ref::<IBStream>().unwrap().as_ptr();
+        if unsafe { self.component.getState(s) } != kResultOk {
+            return Err(Vst3Error::State("save"));
+        }
+        let component = stream.bytes();
+        let mut controller = Vec::new();
+        if self.separate_controller
+            && let Some(c) = &self.controller
+        {
+            let stream = ComWrapper::new(MemoryStream::default());
+            let s = stream.as_com_ref::<IBStream>().unwrap().as_ptr();
+            // A controller with nothing to save may say so; that is not an error.
+            if unsafe { c.getState(s) } == kResultOk {
+                controller = stream.bytes();
+            }
+        }
+        Ok(Vst3State {
+            component,
+            controller,
+        })
+    }
+
+    /// Restores a state from [`save_state`](Self::save_state).
+    pub fn load_state(&mut self, state: &Vst3State) -> Result<(), Vst3Error> {
+        let stream = ComWrapper::new(MemoryStream::from_bytes(&state.component));
+        let s = stream.as_com_ref::<IBStream>().unwrap().as_ptr();
+        if unsafe { self.component.setState(s) } != kResultOk {
+            return Err(Vst3Error::State("load"));
+        }
+        if self.separate_controller
+            && let Some(c) = &self.controller
+        {
+            // The controller learns the component's state, then its own.
+            stream.rewind();
+            unsafe { c.setComponentState(s) };
+            if !state.controller.is_empty() {
+                let stream = ComWrapper::new(MemoryStream::from_bytes(&state.controller));
+                let s = stream.as_com_ref::<IBStream>().unwrap().as_ptr();
+                if unsafe { c.setState(s) } != kResultOk {
+                    return Err(Vst3Error::State("load into the controller"));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Opens the plugin's editor inside `parent`, at the window's `scale`.

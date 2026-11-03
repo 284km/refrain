@@ -110,6 +110,28 @@ sizes are in points on macOS and pixels on Windows, in both formats.
   it would otherwise show an empty window without explanation.
 - The editor is closed before the window it lives in, and before the plugin.
 
+### Projects and plugin state
+
+A plugin's state is bytes only the plugin understands. refrain saves and
+restores them, on the main thread:
+
+- CLAP: the `state` extension's `save` and `load`.
+- VST3: the component's `getState` and `setState`, and the controller's.
+  When restoring, the controller is also given the component's state through
+  `setComponentState`, so its parameters match.
+
+`refrain-project` writes a project as a small JSON file: the plugin's format,
+path and ID, and its state in base64. A relative plugin path is relative to
+the project's folder, and is rewritten when a project is saved somewhere else,
+so projects can move with the plugins next to them. A project is written to a
+temporary file first and renamed over the old one, so a failed save leaves the
+old project whole.
+
+VST3 class IDs are stored the way the VST3 SDK prints them. Windows lays class
+IDs out in memory as COM GUIDs, with the first eight bytes in another order;
+printing the raw bytes would give a different ID there, and a project saved on
+a Mac would not find its plugin on Windows.
+
 ### Test plugins
 
 `refrain-test-tone` is a small sine synth. `refrain-test-synth` (CLAP) and
@@ -125,6 +147,10 @@ MIDI, the VST3 one as parameters it maps through `IMidiMapping`. The other
 takes notes only, so refrain plays the pedal for it. Tests send all four the
 same events and require the same samples. That checks refrain's pedal against
 the plugins' own, and the CLAP host and the VST3 host against each other.
+
+They save their volume, set from MIDI controller 7, as their state. The state
+format is the same in both formats, so a state saved through one host can be
+restored through the other: a test that both hosts pass the bytes intact.
 
 They have an editor too, from `refrain-test-editor`: a fixed 400 × 300 panel
 with the plugin's name, added as a child of the host's window. It checks that
@@ -163,6 +189,10 @@ the device's sample type.
 - **Editors are embedded only.** CLAP plugins whose editor can only float in a
   window of its own are not supported yet, and neither is the CLAP timer
   extension, which some plugins use to redraw on Linux.
+- **Projects are saved when the editor closes or `play` ends**, with `--save`.
+  There is no saving while playing, and no autosave.
+- **A project whose plugin has moved** is not found by ID in the installed
+  plugins; refrain stops and names the path it looked at.
 - **Moving an editor's window between screens of different scale** does not
   tell the plugin about the new scale yet.
 - **VST3 messages.** refrain does not create `IMessage` objects for plugins.
@@ -189,7 +219,9 @@ device:
   of 64 as up. For VST3: not sending mapped controllers, dropping the sample
   offsets of notes or of parameter changes, normalizing pitch bend over 16384,
   and never reading the MIDI mapping, and dropping edits made in the editor.
-  Each one fails a test. For editors, the host was made to skip handing the
+  Each one fails a test. For state: handing a CLAP plugin an empty state,
+  skipping a VST3 component's `setState`, and saving an empty VST3 state. For
+  editors, the host was made to skip handing the
   plugin its window; the check that the window gained a child caught it. One of them first passed, because the
   test synth hid the host's mistake; the synth was changed so it no longer
   does.

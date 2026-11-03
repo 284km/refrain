@@ -1,10 +1,13 @@
-//! Plugins of either format, chosen by file extension.
+//! Plugins of either format, chosen by file extension, and projects that
+//! hold one with its state.
 
-use std::path::Path;
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
 
 use refrain_clap::{ClapError, ClapPlugin};
 use refrain_engine::Processor;
-use refrain_vst3::{Vst3Error, Vst3Module, Vst3Plugin};
+use refrain_project::{Format, Project, State};
+use refrain_vst3::{Vst3Error, Vst3Module, Vst3Plugin, Vst3State};
 
 use crate::Result;
 
@@ -15,12 +18,120 @@ pub struct EditorSize {
     pub resizable: bool,
 }
 
-pub enum Plugin {
+/// A plugin, and the file it came from.
+pub struct Plugin {
+    kind: Kind,
+    file: PathBuf,
+}
+
+impl Deref for Plugin {
+    type Target = Kind;
+
+    fn deref(&self) -> &Kind {
+        &self.kind
+    }
+}
+
+impl DerefMut for Plugin {
+    fn deref_mut(&mut self) -> &mut Kind {
+        &mut self.kind
+    }
+}
+
+impl Plugin {
+    /// Loads a plugin from a `.clap` or `.vst3` file (see [`Kind::open`]), or
+    /// the plugin of a project, with its state.
+    ///
+    /// # Safety
+    ///
+    /// This runs the plugin's code in this process.
+    pub unsafe fn open(path: &Path, id: Option<&str>) -> Result<Self> {
+        let is_project = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(refrain_project::EXTENSION));
+        if !is_project {
+            let kind = unsafe { Kind::open(path, id) }?;
+            return Ok(Self {
+                kind,
+                file: path.to_path_buf(),
+            });
+        }
+        let project = Project::read(path)?;
+        let file = project.plugin_path(path);
+        let instrument = &project.instrument;
+        let mut kind = unsafe { Kind::open(&file, Some(&instrument.id)) }.map_err(|e| {
+            format!(
+                "{}: the project's plugin, {}: {e}",
+                path.display(),
+                file.display()
+            )
+        })?;
+        kind.load_state(&instrument.state)?;
+        println!(
+            "project {}: {} with its saved state",
+            path.display(),
+            instrument.name
+        );
+        Ok(Self { kind, file })
+    }
+
+    /// Writes a project holding this plugin and its current state.
+    pub fn save_project(&mut self, project: &Path) -> Result<()> {
+        let (format, id, name, state) = match &mut self.kind {
+            Kind::Clap(p) => {
+                let data = p.save_state()?.unwrap_or_default();
+                let info = p.info();
+                (
+                    Format::Clap,
+                    info.id.clone(),
+                    info.name.clone(),
+                    State {
+                        data,
+                        controller: Vec::new(),
+                    },
+                )
+            }
+            Kind::Vst3(p) => {
+                let Vst3State {
+                    component,
+                    controller,
+                } = p.save_state()?;
+                let info = p.info();
+                (
+                    Format::Vst3,
+                    info.id.clone(),
+                    info.name.clone(),
+                    State {
+                        data: component,
+                        controller,
+                    },
+                )
+            }
+        };
+        Project::new(project, format, &self.file, id, name, state).write(project)?;
+        Ok(())
+    }
+}
+
+pub enum Kind {
     Clap(ClapPlugin),
     Vst3(Vst3Plugin),
 }
 
-impl Plugin {
+impl Kind {
+    fn load_state(&mut self, state: &State) -> Result<()> {
+        match self {
+            // A plugin that keeps no state saves none, and is given none.
+            Self::Clap(_) if state.data.is_empty() => {}
+            Self::Clap(p) => p.load_state(&state.data)?,
+            Self::Vst3(p) => p.load_state(&Vst3State {
+                component: state.data.clone(),
+                controller: state.controller.clone(),
+            })?,
+        }
+        Ok(())
+    }
+
     /// Loads the plugin `id` from a `.clap` or `.vst3` file. For VST3, `id` is
     /// the plugin's name or class ID. Without an id, a file that holds several
     /// plugins gives its first one, and says so.

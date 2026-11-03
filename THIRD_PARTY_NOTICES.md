@@ -18,6 +18,9 @@ refrain is MIT-licensed and depends only on permissively licensed crates.
 | [libloading](https://github.com/nagisa/rust_libloading) | ISC | Loading VST3 modules |
 | [winit](https://github.com/rust-windowing/winit) | Apache-2.0 | The window that holds a plugin's editor |
 | [raw-window-handle](https://github.com/rust-windowing/raw-window-handle) | MIT OR Apache-2.0 OR Zlib | Passing that window to plugins |
+| [serde](https://github.com/serde-rs/serde) | MIT OR Apache-2.0 | Project files |
+| [serde_json](https://github.com/serde-rs/json) | MIT OR Apache-2.0 | Project files are JSON |
+| [base64](https://github.com/marshallpierce/rust-base64) | MIT OR Apache-2.0 | Plugin states inside project files |
 | [windows-sys](https://github.com/microsoft/windows-rs) | MIT OR Apache-2.0 | Windows only: checking the editor was embedded, and the test plugins' editor |
 
 Their transitive dependencies are listed by `cargo tree` and are all under

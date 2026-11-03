@@ -132,8 +132,19 @@ impl Class for MemoryStream {
 }
 
 impl MemoryStream {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            data: RefCell::new(bytes.to_vec()),
+            position: Cell::new(0),
+        }
+    }
+
     pub fn rewind(&self) {
         self.position.set(0);
+    }
+
+    pub fn bytes(&self) -> Vec<u8> {
+        self.data.borrow().clone()
     }
 }
 

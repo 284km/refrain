@@ -7,10 +7,13 @@
 //! The module holds two instruments that sound the same:
 //!
 //! - [`NAME`] maps MIDI controllers to parameters through `IMidiMapping`, the
-//!   VST3 way of taking them: the sustain pedal, pitch bend and All Notes Off,
-//!   on MIDI channel 1. It plays them itself.
+//!   VST3 way of taking them: the sustain pedal, pitch bend, All Notes Off and
+//!   volume, on MIDI channel 1. It plays them itself.
 //! - [`NOTES_ONLY_NAME`] maps nothing, so the host has to play the sustain
 //!   pedal for it.
+//!
+//! Both save their volume as their state, in the same format as the CLAP
+//! plugins.
 //!
 //! VST3 has no MIDI controller events. Hosts read a plugin's `IMidiMapping`
 //! and send controllers as parameter changes instead.
@@ -21,13 +24,16 @@ use std::cell::{Cell, RefCell};
 use std::ffi::{CString, c_char, c_void};
 use std::ptr;
 use std::slice;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use refrain_test_tone::Tone;
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{Class, ComPtr, ComRef, ComWrapper, uid};
 
-pub use refrain_test_tone::{BEND_SEMITONES, FADE_SECONDS, PEAK, RIGHT_GAIN, key_frequency};
+pub use refrain_test_tone::{
+    BEND_SEMITONES, FADE_SECONDS, PEAK, RIGHT_GAIN, VOLUME_CONTROLLER, key_frequency,
+};
 
 /// The instrument that maps MIDI controllers.
 pub const NAME: &str = "refrain test synth";
@@ -46,6 +52,8 @@ pub mod params {
     pub const PITCH_BEND: ParamID = 1;
     /// All Notes Off, from controller 123: any change releases every note.
     pub const ALL_NOTES_OFF: ParamID = 2;
+    /// The volume, from controller 7: the value over 127. Saved as the state.
+    pub const VOLUME: ParamID = 3;
 }
 
 const MAX_CHANGES: usize = 4096;
@@ -149,6 +157,9 @@ enum Change {
 struct SynthProcessor {
     kind: Kind,
     tone: RefCell<Tone>,
+    // The volume, as f32 bits: set from parameter changes on the audio
+    // thread, and from a saved state on the main thread.
+    volume: AtomicU32,
     // Filled and sorted in process(); allocated in setupProcessing().
     changes: RefCell<Vec<(i32, Change)>>,
 }
@@ -162,6 +173,7 @@ impl SynthProcessor {
         Self {
             kind,
             tone: RefCell::new(Tone::new(48_000.0)),
+            volume: AtomicU32::new(1f32.to_bits()),
             changes: RefCell::new(Vec::with_capacity(MAX_CHANGES)),
         }
     }
@@ -191,6 +203,14 @@ impl SynthProcessor {
                 id: params::ALL_NOTES_OFF,
                 ..
             } => tone.all_notes_off(0),
+            Change::Param {
+                id: params::VOLUME,
+                value,
+            } => {
+                let volume = refrain_test_tone::volume_from_midi((value * 127.0).round() as u8);
+                tone.set_volume(volume);
+                self.volume.store(volume.to_bits(), Ordering::Relaxed);
+            }
             Change::Param { .. } => {}
         }
     }
@@ -328,12 +348,45 @@ impl IComponentTrait for SynthProcessor {
         kResultOk
     }
 
-    unsafe fn setState(&self, _state: *mut IBStream) -> tresult {
-        kResultOk
+    unsafe fn setState(&self, state: *mut IBStream) -> tresult {
+        match unsafe { read_state(state) } {
+            Some(volume) => {
+                self.volume.store(volume.to_bits(), Ordering::Relaxed);
+                kResultOk
+            }
+            None => kResultFalse,
+        }
     }
 
-    unsafe fn getState(&self, _state: *mut IBStream) -> tresult {
+    unsafe fn getState(&self, state: *mut IBStream) -> tresult {
+        let volume = f32::from_bits(self.volume.load(Ordering::Relaxed));
+        unsafe { write_state(state, volume) }
+    }
+}
+
+/// Reads the state from a stream: [`refrain_test_tone::load_state`].
+unsafe fn read_state(stream: *mut IBStream) -> Option<f32> {
+    let stream = unsafe { ComRef::from_raw(stream) }?;
+    let mut bytes = [0u8; 8];
+    let mut read = 0;
+    let ok = unsafe { stream.read(bytes.as_mut_ptr() as *mut c_void, 8, &mut read) };
+    if ok != kResultOk || read != 8 {
+        return None;
+    }
+    refrain_test_tone::load_state(&bytes)
+}
+
+unsafe fn write_state(stream: *mut IBStream, volume: f32) -> tresult {
+    let Some(stream) = (unsafe { ComRef::from_raw(stream) }) else {
+        return kInvalidArgument;
+    };
+    let mut bytes = refrain_test_tone::save_state(volume);
+    let mut written = 0;
+    let ok = unsafe { stream.write(bytes.as_mut_ptr() as *mut c_void, 8, &mut written) };
+    if ok == kResultOk && written == 8 {
         kResultOk
+    } else {
+        kResultFalse
     }
 }
 
@@ -420,6 +473,9 @@ impl IAudioProcessorTrait for SynthProcessor {
         let left = unsafe { slice::from_raw_parts_mut(left_ptr, frames) };
         left.fill(0.0);
 
+        // A state may have been loaded since the last block.
+        let volume = f32::from_bits(self.volume.load(Ordering::Relaxed));
+        self.tone.borrow_mut().set_volume(volume);
         let mut start = 0;
         let changes = self.changes.borrow();
         for &(offset, change) in changes.iter() {
@@ -453,7 +509,7 @@ impl IProcessContextRequirementsTrait for SynthProcessor {
 
 struct SynthController {
     kind: Kind,
-    values: [Cell<f64>; 3],
+    values: [Cell<f64>; 4],
     handler: RefCell<Option<ComPtr<IComponentHandler>>>,
 }
 
@@ -465,13 +521,18 @@ impl SynthController {
     fn new(kind: Kind) -> Self {
         Self {
             kind,
-            values: [Cell::new(0.0), Cell::new(8192.0 / 16383.0), Cell::new(0.0)],
+            values: [
+                Cell::new(0.0),
+                Cell::new(8192.0 / 16383.0),
+                Cell::new(0.0),
+                Cell::new(1.0),
+            ],
             handler: RefCell::new(None),
         }
     }
 
     fn param_count(&self) -> i32 {
-        if self.kind == Kind::Full { 3 } else { 0 }
+        if self.kind == Kind::Full { 4 } else { 0 }
     }
 }
 
@@ -486,7 +547,11 @@ impl IPluginBaseTrait for SynthController {
 }
 
 impl IEditControllerTrait for SynthController {
-    unsafe fn setComponentState(&self, _state: *mut IBStream) -> tresult {
+    unsafe fn setComponentState(&self, state: *mut IBStream) -> tresult {
+        // Keep the volume parameter in step with the processor's state.
+        if let Some(volume) = unsafe { read_state(state) } {
+            self.values[params::VOLUME as usize].set(f64::from(volume));
+        }
         kResultOk
     }
 
@@ -507,7 +572,7 @@ impl IEditControllerTrait for SynthController {
             return kInvalidArgument;
         }
         let info = unsafe { &mut *info };
-        let title = ["Sustain", "Pitch bend", "All notes off"][index as usize];
+        let title = ["Sustain", "Pitch bend", "All notes off", "Volume"][index as usize];
         info.id = index as ParamID;
         copy_wstring(title, &mut info.title);
         copy_wstring(title, &mut info.shortTitle);
@@ -600,6 +665,7 @@ impl IMidiMappingTrait for SynthController {
             ControllerNumbers_::kCtrlSustainOnOff => params::SUSTAIN,
             ControllerNumbers_::kPitchBend => params::PITCH_BEND,
             ControllerNumbers_::kCtrlAllNotesOff => params::ALL_NOTES_OFF,
+            ControllerNumbers_::kCtrlVolume => params::VOLUME,
             _ => return kResultFalse,
         };
         unsafe { *id = param };

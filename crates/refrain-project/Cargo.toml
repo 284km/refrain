@@ -1,0 +1,13 @@
+[package]
+name = "refrain-project"
+description = "refrain's project files: which plugin, and its state."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64 = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,13 @@
+{
+  "refrain": 1,
+  "instrument": {
+    "format": "clap",
+    "path": "../../target/test-plugins/refrain-test-synth.clap",
+    "id": "dev.refrain.test-synth",
+    "name": "refrain test synth",
+    "state": {
+      "data": "cnRzMQAAAD8=",
+      "controller": ""
+    }
+  }
+}

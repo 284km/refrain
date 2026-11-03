@@ -22,6 +22,32 @@ pub const FADE_SECONDS: f32 = 0.005;
 /// How far a full pitch bend goes, in semitones.
 pub const BEND_SEMITONES: f64 = 2.0;
 
+/// The MIDI controller that sets the volume: Channel Volume.
+pub const VOLUME_CONTROLLER: u8 = 7;
+
+/// The volume a MIDI controller value sets. Both plugin formats compute it
+/// this way, so they agree exactly.
+pub fn volume_from_midi(value: u8) -> f32 {
+    f32::from(value.min(127)) / 127.0
+}
+
+/// The plugins' saved state: their volume. Eight bytes, the same in both
+/// formats and on every platform: `rts1` and the volume as a little-endian
+/// `f32`.
+pub fn save_state(volume: f32) -> [u8; 8] {
+    let mut state = *b"rts1\0\0\0\0";
+    state[4..].copy_from_slice(&volume.to_le_bytes());
+    state
+}
+
+/// Reads a state written by [`save_state`]. `None` if it is not one, or the
+/// volume is out of range.
+pub fn load_state(state: &[u8]) -> Option<f32> {
+    let (magic, volume) = state.split_first_chunk::<4>()?;
+    let volume = f32::from_le_bytes(*volume.first_chunk::<4>()?);
+    (magic == b"rts1" && (0.0..=1.0).contains(&volume)).then_some(volume)
+}
+
 const VOICES: usize = 16;
 
 /// The pitch of a MIDI key, with A4 (key 69) at 440 Hz.
@@ -53,6 +79,7 @@ pub struct Tone {
     pedal_down: [bool; 16],
     // Pitch factor per MIDI channel, from pitch bend.
     bend: [f64; 16],
+    volume: f32,
 }
 
 fn matches(want: Option<u16>, have: u16) -> bool {
@@ -67,6 +94,7 @@ impl Tone {
             fade_step: 1.0 / (FADE_SECONDS * sample_rate as f32),
             pedal_down: [false; 16],
             bend: [1.0; 16],
+            volume: 1.0,
         }
     }
 
@@ -134,8 +162,17 @@ impl Tone {
         self.bend[usize::from(channel & 0x0f)] = 2f64.powf(semitones / 12.0);
     }
 
-    /// Plays a MIDI 1.0 message: notes, the sustain pedal, All Notes Off and
-    /// pitch bend. Anything else is ignored.
+    /// The volume of everything, from 0 to 1. It applies to sounding notes.
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
+    }
+
+    pub fn volume(&self) -> f32 {
+        self.volume
+    }
+
+    /// Plays a MIDI 1.0 message: notes, the sustain pedal, All Notes Off,
+    /// volume and pitch bend. Anything else is ignored.
     pub fn midi(&mut self, [status, a, b]: [u8; 3]) {
         let channel = u16::from(status & 0x0f);
         match (status & 0xf0, a) {
@@ -143,6 +180,7 @@ impl Tone {
             (0x80 | 0x90, _) => self.note_off(Some(channel), Some(a.into())),
             (0xb0, 64) => self.pedal(channel, b >= 64),
             (0xb0, 123) => self.all_notes_off(channel),
+            (0xb0, VOLUME_CONTROLLER) => self.set_volume(volume_from_midi(b)),
             (0xe0, _) => self.bend(channel, u16::from(b) << 7 | u16::from(a)),
             _ => {}
         }
@@ -158,6 +196,7 @@ impl Tone {
     /// Adds the sound of the next `out.len()` samples to `out`.
     pub fn render(&mut self, out: &mut [f32]) {
         let bend = self.bend;
+        let volume = self.volume;
         for v in self.voices.iter_mut().filter(|v| v.active) {
             let step = v.base_step * bend[usize::from(v.channel & 0x0f)];
             for sample in out.iter_mut() {
@@ -171,7 +210,7 @@ impl Tone {
                     v.level = (v.level + self.fade_step).min(1.0);
                 }
                 let s = (std::f64::consts::TAU * v.phase).sin() as f32;
-                *sample += s * v.gain * v.level;
+                *sample += s * v.gain * v.level * volume;
                 v.phase += step;
                 v.phase -= v.phase.floor();
             }
@@ -191,5 +230,24 @@ impl Tone {
 
     pub fn stop(&mut self) {
         self.choke(None, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_round_trips_and_rejects_garbage() {
+        for volume in [0.0, 64.0 / 127.0, 0.5, 1.0] {
+            assert_eq!(load_state(&save_state(volume)), Some(volume));
+        }
+        assert_eq!(&save_state(0.5), b"rts1\x00\x00\x00\x3f");
+        assert_eq!(load_state(b"rts1"), None);
+        assert_eq!(load_state(b"xxxx\x00\x00\x00\x3f"), None);
+        assert_eq!(
+            load_state(&[b'r', b't', b's', b'1', 0, 0, 0x80, 0x7f]),
+            None
+        ); // infinity
     }
 }

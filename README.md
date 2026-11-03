@@ -26,6 +26,7 @@ crates/
   refrain-test-synth/       CLAP test plugins, used to test hosting
   refrain-test-synth-vst3/  VST3 test plugins that sound the same
   refrain-test-editor/      the test plugins' editor: a panel with their name
+  refrain-project/          project files: which plugin, and its state
   refrain/                  the `refrain` command: audio devices, MIDI, WAV output
 scripts/
   build-test-plugins.sh     builds the test plugins as .clap and .vst3 files
@@ -64,6 +65,18 @@ cargo run -- editor target/test-plugins/refrain-test-synth.clap        # the edi
 
 `play` opens the plugin's editor in a window when it has one; `--no-editor`
 leaves it closed.
+
+To keep a sound, save the plugin and its state as a project when you close
+the editor, and open the project instead of the plugin next time:
+
+```sh
+cargo run -- play target/test-plugins/refrain-test-synth.vst3 --save song.refrain
+cargo run -- play song.refrain                        # the same plugin, the same sound
+cargo run -- render out.wav --plugin song.refrain
+```
+
+A project is a small JSON file. A plugin path in it that is relative is
+relative to the project's folder.
 
 An installed instrument works the same way: pass its `.clap` or `.vst3`
 file or bundle. When a file holds several plugins, `--id` chooses one

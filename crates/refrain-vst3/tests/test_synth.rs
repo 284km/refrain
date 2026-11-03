@@ -338,3 +338,75 @@ fn edits_in_the_editor_reach_the_processor() {
         "the edit had no effect"
     );
 }
+
+/// Renders through a fresh VST3 plugin, after loading `state` if given, and
+/// returns the output and the plugin's state afterwards.
+fn vst3_with_state(
+    name: &str,
+    state: Option<&refrain_vst3::Vst3State>,
+    events: &[TimedEvent],
+) -> (Vec<f32>, refrain_vst3::Vst3State) {
+    let module = module();
+    let mut plugin = Vst3Plugin::new(&module, Some(name)).unwrap();
+    if let Some(state) = state {
+        plugin.load_state(state).unwrap();
+    }
+    let mut processor = plugin.activate(RATE, 1_024).unwrap();
+    let out = render_offline(&mut processor, RATE, 2, FRAMES, 128, events);
+    drop(processor);
+    let saved = plugin.save_state().unwrap();
+    (out, saved)
+}
+
+#[test]
+fn a_saved_state_brings_the_sound_back() {
+    use refrain_test_synth_vst3::VOLUME_CONTROLLER;
+    let a4 = [on(0.1, 69, 1.0), off(0.6, 69)];
+    let mut turned_down = vec![cc(0.0, VOLUME_CONTROLLER, 64)];
+    turned_down.extend(a4);
+    let (quieter, saved) = vst3_with_state(NAME, None, &turned_down);
+    assert_eq!(saved.component, refrain_test_tone::save_state(64.0 / 127.0));
+
+    let (restored, resaved) = vst3_with_state(NAME, Some(&saved), &a4);
+    assert_eq!(restored, quieter);
+    assert_eq!(resaved, saved);
+    let (default, _) = vst3_with_state(NAME, None, &a4);
+    assert_ne!(restored, default);
+
+    // The CLAP plugin turned down the same way sounds the same.
+    assert_eq!(quieter, render_clap(128, &turned_down));
+}
+
+#[test]
+fn a_state_saved_by_the_clap_plugin_restores_in_the_vst3_one() {
+    // The test plugins share one state format, so this crosses formats. Real
+    // plugins do not promise that; this checks both hosts pass bytes intact.
+    let entry =
+        PluginEntry::load_from_clack::<refrain_test_synth::Entry>(c"refrain-test-synth").unwrap();
+    let mut clap = ClapPlugin::new(&entry, Some(refrain_test_synth::NOTES_ONLY_ID)).unwrap();
+    clap.load_state(&refrain_test_tone::save_state(0.25))
+        .unwrap();
+    let bytes = clap.save_state().unwrap().unwrap();
+    let state = refrain_vst3::Vst3State {
+        component: bytes,
+        controller: Vec::new(),
+    };
+    let a4 = [on(0.1, 69, 1.0), off(0.6, 69)];
+    let (restored, _) = vst3_with_state(NOTES_ONLY_NAME, Some(&state), &a4);
+    let (default, _) = vst3_with_state(NOTES_ONLY_NAME, None, &a4);
+    for (r, d) in restored.iter().zip(&default) {
+        assert_eq!(*r, *d * 0.25);
+    }
+}
+
+#[test]
+fn a_broken_state_is_refused() {
+    let module = module();
+    let mut plugin = Vst3Plugin::new(&module, Some(NAME)).unwrap();
+    let broken = refrain_vst3::Vst3State {
+        component: b"nope".to_vec(),
+        controller: Vec::new(),
+    };
+    let err = plugin.load_state(&broken).unwrap_err();
+    assert!(matches!(err, Vst3Error::State(_)), "{err}");
+}
