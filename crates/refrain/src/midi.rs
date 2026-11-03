@@ -1,7 +1,7 @@
 //! MIDI input from keyboards and other controllers.
 
 use midir::{Ignore, MidiInput, MidiInputConnection};
-use refrain_engine::NoteEvent;
+use refrain_engine::Event;
 
 use crate::Result;
 
@@ -18,19 +18,19 @@ pub fn port_names() -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// An open MIDI input. Notes stop arriving when it is dropped.
+/// An open MIDI input. Events stop arriving when it is dropped.
 pub struct Connection {
     pub port_name: String,
     _connection: MidiInputConnection<()>,
 }
 
-/// Connects to a MIDI input and sends its notes to `notes`.
+/// Connects to a MIDI input and sends what it plays to `events`.
 ///
 /// `select` is a port index or part of a port name. Without it, the first
 /// port is used. Returns `None` when there is no MIDI input at all.
 pub fn connect(
     select: Option<&str>,
-    mut notes: rtrb::Producer<NoteEvent>,
+    mut events: rtrb::Producer<Event>,
 ) -> Result<Option<Connection>> {
     let mut input = MidiInput::new(CLIENT)?;
     input.ignore(Ignore::All);
@@ -63,10 +63,10 @@ pub fn connect(
         &ports[index],
         "refrain input",
         move |_timestamp, bytes, _| {
-            if let Some(note) = NoteEvent::from_midi(bytes) {
-                // When the queue is full the note is dropped rather than
+            if let Some(event) = Event::from_midi(bytes) {
+                // When the queue is full the event is dropped rather than
                 // blocking the MIDI thread.
-                let _ = notes.push(note);
+                let _ = events.push(event);
             }
         },
         (),
@@ -84,10 +84,10 @@ mod tests {
     use midir::os::unix::VirtualOutput;
     use std::time::{Duration, Instant};
 
-    /// Sends notes from a virtual MIDI port and checks they come out of the
+    /// Plays into a virtual MIDI port and checks the events come out of the
     /// queue the audio thread reads.
     #[test]
-    fn notes_from_a_midi_port_reach_the_queue() {
+    fn events_from_a_midi_port_reach_the_queue() {
         let name = format!("refrain-test-{}", std::process::id());
         let mut port = MidiOutput::new("refrain-test")
             .unwrap()
@@ -98,12 +98,13 @@ mod tests {
         assert_eq!(connection.port_name, name);
 
         port.send(&[0x90, 60, 127]).unwrap();
-        port.send(&[0xb0, 64, 127]).unwrap(); // sustain pedal: not a note
+        port.send(&[0xb0, 64, 127]).unwrap(); // sustain pedal down
+        port.send(&[0xf8]).unwrap(); // clock: not read
         port.send(&[0x80, 60, 0]).unwrap();
 
         let mut received = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while received.len() < 2 && Instant::now() < deadline {
+        while received.len() < 3 && Instant::now() < deadline {
             match rx.pop() {
                 Ok(note) => received.push(note),
                 Err(_) => std::thread::sleep(Duration::from_millis(5)),
@@ -112,12 +113,17 @@ mod tests {
         assert_eq!(
             received,
             [
-                NoteEvent::On {
+                Event::NoteOn {
                     channel: 0,
                     key: 60,
                     velocity: 1.0
                 },
-                NoteEvent::Off {
+                Event::Controller {
+                    channel: 0,
+                    number: 64,
+                    value: 127
+                },
+                Event::NoteOff {
                     channel: 0,
                     key: 60,
                     velocity: 0.0

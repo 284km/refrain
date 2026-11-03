@@ -5,7 +5,8 @@ A DAW for macOS and Windows, written in Rust.
 [日本語](README.ja.md)
 
 > Status: very early. refrain hosts CLAP instruments and plays them from a MIDI
-> input, on an audio device or offline into a WAV file. There is no GUI yet,
+> input, sustain pedal and pitch bend included, on an audio device or offline
+> into a WAV file. There is no GUI yet,
 > only the `refrain` command.
 
 ## Goals

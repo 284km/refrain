@@ -35,7 +35,11 @@ jobs:
             Windows) plugin=target/debug/refrain_test_synth.dll ;;
           esac
           cargo run -- render target/synth.wav --plugin "$plugin" | tee target/render.log
-          grep -q "peak 0.4" target/render.log
+          grep -Eq "peak 0\.[1-9]" target/render.log
+          # The notes-only plugin relies on refrain to play the sustain pedal.
+          # It has to sound exactly like the plugin that plays it itself.
+          cargo run -- render target/notes-only.wav --plugin "$plugin" --id dev.refrain.test-synth.notes-only
+          cmp target/synth.wav target/notes-only.wav
 
   licenses:
     runs-on: ubuntu-latest

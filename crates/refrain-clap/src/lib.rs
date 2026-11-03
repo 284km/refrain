@@ -23,9 +23,14 @@ use clack_extensions::params::{
     HostParams, HostParamsImplMainThread, HostParamsImplShared, ParamClearFlags, ParamRescanFlags,
 };
 use clack_host::events::event_types::{MidiEvent, NoteOffEvent, NoteOnEvent};
-use clack_host::events::{EventFlags, Match};
+use clack_host::events::{Event as _, EventFlags, Match};
 use clack_host::prelude::*;
-use refrain_engine::{MAX_BLOCK_EVENTS, NoteEvent, Processor, TimedEvent};
+
+/// A loaded CLAP file. Get one from [`load_entry`].
+pub use clack_host::entry::PluginEntry;
+use refrain_engine::{
+    Event, MAX_BLOCK_EVENTS, MAX_PEDAL_RELEASES, Processor, SustainPedal, TimedEvent,
+};
 
 /// What a plugin says about itself.
 #[derive(Clone, Debug)]
@@ -367,16 +372,29 @@ impl ClapPlugin {
             inputs: alloc(&input_channels),
             outputs: alloc(&output_channels),
             main_output,
-            events: EventBuffer::with_capacity(MAX_BLOCK_EVENTS),
+            events: EventBuffer::with_capacity(MAX_EVENTS),
             note_port,
+            pedal: SustainPedal::default(),
+            notes: Vec::with_capacity(MAX_EVENTS),
             steady_time: 0,
             failed: false,
         })
     }
 }
 
-/// The note port to send notes to, and whether it only understands MIDI.
-fn find_note_port(handle: &PluginMainThreadHandle) -> Option<(u16, bool)> {
+/// The most events one block can hand a plugin: the block's own, plus the
+/// note offs the sustain pedal can add.
+const MAX_EVENTS: usize = MAX_BLOCK_EVENTS + MAX_PEDAL_RELEASES;
+
+/// The note port a plugin takes notes on, and the dialects it understands.
+#[derive(Clone, Copy)]
+struct NotePort {
+    index: u16,
+    clap: bool,
+    midi: bool,
+}
+
+fn find_note_port(handle: &PluginMainThreadHandle) -> Option<NotePort> {
     let ext = handle.get_extension::<PluginNotePorts>()?;
     let mut buffer = NotePortInfoBuffer::new();
     let count = ext.count(handle, true).min(u32::from(u16::MAX));
@@ -386,7 +404,11 @@ fn find_note_port(handle: &PluginMainThreadHandle) -> Option<(u16, bool)> {
         if !dialects.intersects(NoteDialects::CLAP | NoteDialects::MIDI) {
             return None;
         }
-        Some((i as u16, !dialects.contains(NoteDialects::CLAP)))
+        Some(NotePort {
+            index: i as u16,
+            clap: dialects.contains(NoteDialects::CLAP),
+            midi: dialects.contains(NoteDialects::MIDI),
+        })
     })
 }
 
@@ -403,7 +425,10 @@ pub struct ClapProcessor {
     outputs: Vec<Vec<f32>>,
     main_output: usize,
     events: EventBuffer,
-    note_port: Option<(u16, bool)>,
+    note_port: Option<NotePort>,
+    // For plugins that take notes only, the host plays the sustain pedal.
+    pedal: SustainPedal,
+    notes: Vec<TimedEvent>,
     steady_time: u64,
     failed: bool,
 }
@@ -415,42 +440,52 @@ impl ClapProcessor {
         self.failed
     }
 
+    /// Turns the block's events into CLAP events, in the dialects the
+    /// plugin understands.
+    ///
+    /// A plugin that takes MIDI gets notes as CLAP notes, when it takes those
+    /// too, and everything else as MIDI: it plays the pedal itself. A plugin
+    /// that takes CLAP notes only gets notes, with the pedal played for it.
     fn push_events(&mut self, events: &[TimedEvent]) {
         self.events.clear();
-        let Some((port, midi_only)) = self.note_port else {
+        let Some(port) = self.note_port else {
             return;
         };
-        for e in events.iter().take(MAX_BLOCK_EVENTS) {
-            let (on, channel, key, velocity) = match e.event {
-                NoteEvent::On {
-                    channel,
-                    key,
-                    velocity,
-                } => (true, channel, key, velocity),
-                NoteEvent::Off {
-                    channel,
-                    key,
-                    velocity,
-                } => (false, channel, key, velocity),
-            };
-            if midi_only {
-                let status = if on { 0x90 } else { 0x80 } | (channel & 0x0f);
-                let data = [status, key, (velocity * 127.0).round() as u8];
-                self.events.push(&MidiEvent::new(e.frame, port, data));
-                continue;
+        let events = &events[..events.len().min(MAX_BLOCK_EVENTS)];
+        if port.midi {
+            for e in events {
+                if port.clap && e.event.is_note() {
+                    push_note(&mut self.events, port.index, e);
+                } else {
+                    let midi = MidiEvent::new(e.frame, port.index, e.event.to_midi());
+                    self.events.push(&midi.with_flags(EventFlags::IS_LIVE));
+                }
             }
-            let pckn = Pckn::new(port, u16::from(channel), u16::from(key), Match::All);
-            let velocity = f64::from(velocity);
-            if on {
-                self.events.push(
-                    &NoteOnEvent::new(e.frame, pckn, velocity).with_flags(EventFlags::IS_LIVE),
-                );
-            } else {
-                self.events.push(
-                    &NoteOffEvent::new(e.frame, pckn, velocity).with_flags(EventFlags::IS_LIVE),
-                );
+        } else {
+            self.notes.clear();
+            self.pedal.apply(events, &mut self.notes);
+            for e in &self.notes {
+                push_note(&mut self.events, port.index, e);
             }
         }
+    }
+}
+
+/// Pushes a note on or off as a CLAP note event. Other events are ignored.
+fn push_note(buffer: &mut EventBuffer, port: u16, e: &TimedEvent) {
+    let (channel, key) = match e.event {
+        Event::NoteOn { channel, key, .. } | Event::NoteOff { channel, key, .. } => (channel, key),
+        _ => return,
+    };
+    let pckn = Pckn::new(port, u16::from(channel), u16::from(key), Match::All);
+    match e.event {
+        Event::NoteOn { velocity, .. } => buffer.push(
+            &NoteOnEvent::new(e.frame, pckn, f64::from(velocity)).with_flags(EventFlags::IS_LIVE),
+        ),
+        Event::NoteOff { velocity, .. } => buffer.push(
+            &NoteOffEvent::new(e.frame, pckn, f64::from(velocity)).with_flags(EventFlags::IS_LIVE),
+        ),
+        _ => {}
     }
 }
 
@@ -463,6 +498,7 @@ impl Processor for ClapProcessor {
             "activate the plugin again to change the sample rate or block size"
         );
         self.steady_time = 0;
+        self.pedal.reset();
     }
 
     fn process(&mut self, out: &mut [f32], channels: usize, events: &[TimedEvent]) {

@@ -2,7 +2,7 @@
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
-use refrain_engine::{MAX_BLOCK_EVENTS, MAX_BLOCK_FRAMES, NoteEvent, Processor, TimedEvent};
+use refrain_engine::{Event, MAX_BLOCK_EVENTS, MAX_BLOCK_FRAMES, Processor, TimedEvent};
 
 use crate::Result;
 
@@ -48,7 +48,7 @@ impl Output {
     pub fn start(
         &self,
         processor: impl Processor + 'static,
-        events: Option<rtrb::Consumer<NoteEvent>>,
+        events: Option<rtrb::Consumer<Event>>,
     ) -> Result<cpal::Stream> {
         let config: cpal::StreamConfig = self.config.into();
         let stream = match self.config.sample_format() {
@@ -67,7 +67,7 @@ fn build<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
     mut processor: impl Processor + 'static,
-    mut events: Option<rtrb::Consumer<NoteEvent>>,
+    mut events: Option<rtrb::Consumer<Event>>,
 ) -> Result<cpal::Stream>
 where
     T: SizedSample + FromSample<f32>,

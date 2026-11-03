@@ -14,54 +14,11 @@ pub const MAX_BLOCK_FRAMES: usize = 1024;
 /// block, so buffers for them can be allocated up front.
 pub const MAX_BLOCK_EVENTS: usize = 256;
 
-/// A note starting or stopping.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum NoteEvent {
-    On { channel: u8, key: u8, velocity: f32 },
-    Off { channel: u8, key: u8, velocity: f32 },
-}
+mod event;
 
-impl NoteEvent {
-    /// Reads a MIDI 1.0 channel message. Returns `None` for anything that is
-    /// not a note on or note off.
-    pub fn from_midi(bytes: &[u8]) -> Option<Self> {
-        let [status, key, velocity, ..] = *bytes else {
-            return None;
-        };
-        if key > 127 || velocity > 127 {
-            return None;
-        }
-        let channel = status & 0x0f;
-        let v = f32::from(velocity) / 127.0;
-        match status & 0xf0 {
-            // A note on with velocity 0 is a note off, by convention.
-            0x90 if velocity == 0 => Some(Self::Off {
-                channel,
-                key,
-                velocity: 0.5,
-            }),
-            0x90 => Some(Self::On {
-                channel,
-                key,
-                velocity: v,
-            }),
-            0x80 => Some(Self::Off {
-                channel,
-                key,
-                velocity: v,
-            }),
-            _ => None,
-        }
-    }
-}
-
-/// An event at a frame offset. Inside a block, `frame` counts from the start
-/// of the block. Events in a block are in order of `frame`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TimedEvent {
-    pub frame: u32,
-    pub event: NoteEvent,
-}
+pub use event::{
+    ALL_NOTES_OFF, Event, MAX_PEDAL_RELEASES, PITCH_BEND_CENTRE, SUSTAIN, SustainPedal, TimedEvent,
+};
 
 /// Something that fills audio buffers.
 ///
@@ -231,12 +188,12 @@ mod tests {
 
     #[test]
     fn events_arrive_in_their_block_at_their_frame() {
-        let on = NoteEvent::On {
+        let on = Event::NoteOn {
             channel: 0,
             key: 60,
             velocity: 1.0,
         };
-        let off = NoteEvent::Off {
+        let off = Event::NoteOff {
             channel: 0,
             key: 60,
             velocity: 1.0,
@@ -267,33 +224,5 @@ mod tests {
             render_offline(&mut recorder, RATE, 2, 1_000, block, &events);
             assert_eq!(recorder.seen, events, "block size {block}");
         }
-    }
-
-    #[test]
-    fn reads_midi_notes() {
-        assert_eq!(
-            NoteEvent::from_midi(&[0x91, 60, 127]),
-            Some(NoteEvent::On {
-                channel: 1,
-                key: 60,
-                velocity: 1.0
-            })
-        );
-        assert_eq!(
-            NoteEvent::from_midi(&[0x80, 60, 0]),
-            Some(NoteEvent::Off {
-                channel: 0,
-                key: 60,
-                velocity: 0.0
-            })
-        );
-        assert!(matches!(
-            NoteEvent::from_midi(&[0x90, 60, 0]),
-            Some(NoteEvent::Off { key: 60, .. })
-        ));
-        // Control change, a short message, and a data byte out of range.
-        assert_eq!(NoteEvent::from_midi(&[0xb0, 64, 127]), None);
-        assert_eq!(NoteEvent::from_midi(&[0x90, 60]), None);
-        assert_eq!(NoteEvent::from_midi(&[0x90, 200, 1]), None);
     }
 }

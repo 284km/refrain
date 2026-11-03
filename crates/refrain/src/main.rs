@@ -15,8 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait};
+use refrain_clap::{ClapError, PluginEntry};
 use refrain_clap::{ClapPlugin, find_clap_files, load_entry, plugins_in, standard_paths};
-use refrain_engine::{NoteEvent, Sine, TimedEvent, render_offline};
+use refrain_engine::{Event, SUSTAIN, Sine, TimedEvent, render_offline};
 
 use audio::Output;
 
@@ -137,13 +138,31 @@ impl Options {
 }
 
 /// A short phrase for trying an instrument without a keyboard: C, E, G and C
-/// one after another, then the C major chord. Times are in seconds.
-fn demo_phrase() -> Vec<(f64, NoteEvent)> {
-    let mut phrase = Vec::new();
+/// one after another with the sustain pedal down, so they ring together, then
+/// the C major chord without it. Times are in seconds.
+fn demo_phrase() -> Vec<(f64, Event)> {
+    let mut phrase = vec![
+        (
+            0.0,
+            Event::Controller {
+                channel: 0,
+                number: SUSTAIN,
+                value: 127,
+            },
+        ),
+        (
+            0.95,
+            Event::Controller {
+                channel: 0,
+                number: SUSTAIN,
+                value: 0,
+            },
+        ),
+    ];
     let mut note = |start: f64, end: f64, key: u8| {
         phrase.push((
             start,
-            NoteEvent::On {
+            Event::NoteOn {
                 channel: 0,
                 key,
                 velocity: 0.8,
@@ -151,7 +170,7 @@ fn demo_phrase() -> Vec<(f64, NoteEvent)> {
         ));
         phrase.push((
             end,
-            NoteEvent::Off {
+            Event::NoteOff {
                 channel: 0,
                 key,
                 velocity: 0.8,
@@ -159,14 +178,30 @@ fn demo_phrase() -> Vec<(f64, NoteEvent)> {
         ));
     };
     for (i, key) in [60, 64, 67, 72].into_iter().enumerate() {
-        let start = i as f64 * 0.25;
-        note(start, start + 0.2, key);
+        let start = i as f64 * 0.2;
+        note(start, start + 0.15, key);
     }
     for key in [60, 64, 67] {
         note(1.0, 1.8, key);
     }
     phrase.sort_by(|a, b| a.0.total_cmp(&b.0));
     phrase
+}
+
+/// Instantiates a plugin from `entry`. Without an id, a file that holds
+/// several plugins gives its first one, and says so.
+fn open_plugin(entry: &PluginEntry, id: Option<&str>) -> Result<ClapPlugin> {
+    match ClapPlugin::new(entry, id) {
+        Err(ClapError::Ambiguous(ids)) => {
+            println!(
+                "this file holds {} plugins; using the first. Choose with --id: {}",
+                ids.len(),
+                ids.join(", ")
+            );
+            Ok(ClapPlugin::new(entry, Some(&ids[0]))?)
+        }
+        other => Ok(other?),
+    }
 }
 
 fn devices() -> Result<()> {
@@ -240,24 +275,24 @@ fn sine(o: &Options) -> Result<()> {
 fn play(path: &str, o: &Options) -> Result<()> {
     // SAFETY: the user asked for this file to be loaded.
     let entry = unsafe { load_entry(Path::new(path)) }?;
-    let mut plugin = ClapPlugin::new(&entry, o.id.as_deref())?;
+    let mut plugin = open_plugin(&entry, o.id.as_deref())?;
     let output = Output::open(o.device.as_deref())?;
     let processor = plugin.activate(output.sample_rate(), refrain_engine::MAX_BLOCK_FRAMES)?;
     println!("{}", plugin.info());
     println!("output: {}", output.describe());
 
-    // Notes reach the audio thread through this queue, from the MIDI thread
+    // Events reach the audio thread through this queue, from the MIDI thread
     // or, with --demo, from the loop below.
     let (to_audio, from_notes) = rtrb::RingBuffer::new(1024);
     let mut demo = Vec::new();
-    let mut demo_notes = None;
+    let mut demo_events = None;
     let mut _midi = None;
     let mut seconds = o.seconds;
     if o.demo {
         demo = demo_phrase();
         let end = demo.last().map_or(0.0, |e| e.0);
         seconds.get_or_insert(end + 0.5);
-        demo_notes = Some(to_audio);
+        demo_events = Some(to_audio);
         println!("playing the demo phrase");
     } else {
         _midi = midi::connect(o.midi.as_deref(), to_audio)?;
@@ -285,9 +320,9 @@ fn play(path: &str, o: &Options) -> Result<()> {
         if stop.load(Ordering::Acquire) || seconds.is_some_and(|s| elapsed >= s) {
             break;
         }
-        while let Some((_, note)) = demo.next_if(|(t, _)| *t <= elapsed) {
-            if let Some(tx) = demo_notes.as_mut() {
-                let _ = tx.push(note);
+        while let Some((_, event)) = demo.next_if(|(t, _)| *t <= elapsed) {
+            if let Some(tx) = demo_events.as_mut() {
+                let _ = tx.push(event);
             }
         }
         plugin.poll_main_thread();
@@ -320,7 +355,7 @@ fn render(path: &str, o: &Options) -> Result<()> {
         Some(plugin_path) => {
             // SAFETY: the user asked for this file to be loaded.
             let entry = unsafe { load_entry(Path::new(plugin_path)) }?;
-            let mut plugin = ClapPlugin::new(&entry, o.id.as_deref())?;
+            let mut plugin = open_plugin(&entry, o.id.as_deref())?;
             println!("{}", plugin.info());
             let mut processor = plugin.activate(rate, block)?;
             let events: Vec<TimedEvent> = demo_phrase()
