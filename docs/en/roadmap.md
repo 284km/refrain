@@ -14,7 +14,8 @@ heard or checked on both macOS and Windows.
 | 5 | Record and play back MIDI clips on a timeline | Done. Recording layers a new clip over the ones there, with a metronome; CI checks clips play back exactly like the same phrase sent as events |
 | 6 | Effect chains and a mixer | Done. Tracks with an instrument, a chain of effects, volume, pan, mute and solo, mixed through a master chain; test effects in both formats; CI puts a project together with the project commands and checks its mix in both formats |
 | 7 | Render a project to a WAV file | Done. Renders until the sound dies away, with plugins told it is offline, to 32-bit float or 16- or 24-bit integers with optional dither; CI checks the length, the file sizes and that dither is the same every time |
-| 8 | refrain's own GUI: transport, tracks, clips and the mixer | Next |
+| 8 | refrain's own window: transport, tracks, clips and the mixer | Done. `refrain gui` plays, stops, locates and records, changes the mix while playing, shows the clips and opens plugins' editors; clicking through it is tested without a screen, and CI opens it on macOS and Windows |
+| 8b | Adding, removing and choosing plugins in the window; opening and saving projects under other names | Next |
 
 ## Alongside the steps
 

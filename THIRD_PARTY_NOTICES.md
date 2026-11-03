@@ -16,7 +16,13 @@ refrain is MIT-licensed and depends only on permissively licensed crates.
 | [clack-plugin](https://github.com/prokopyl/clack) | MIT OR Apache-2.0 | The CLAP test plugins only, which are not part of refrain itself |
 | [vst3](https://github.com/coupler-rs/vst3-rs) | MIT OR Apache-2.0 | Bindings to the VST3 API, generated from the MIT-licensed VST3 SDK headers |
 | [libloading](https://github.com/nagisa/rust_libloading) | ISC | Loading VST3 modules |
-| [winit](https://github.com/rust-windowing/winit) | Apache-2.0 | The window that holds a plugin's editor |
+| [winit](https://github.com/rust-windowing/winit) | Apache-2.0 | refrain's window, and the windows that hold plugins' editors |
+| [egui](https://github.com/emilk/egui) | MIT OR Apache-2.0 | Drawing refrain's window. Default features are off, so egui's bundled fonts are not used |
+| [egui-winit](https://github.com/emilk/egui) | MIT OR Apache-2.0 | Input from the window to egui |
+| [egui-wgpu](https://github.com/emilk/egui) | MIT OR Apache-2.0 | Painting egui through wgpu |
+| [wgpu](https://github.com/gfx-rs/wgpu) | MIT OR Apache-2.0 | The GPU, through Metal on macOS and Direct3D 12 on Windows |
+| [pollster](https://github.com/zesterer/pollster) | MIT OR Apache-2.0 | Waiting for wgpu's set-up |
+| [egui_kittest](https://github.com/emilk/egui) | MIT OR Apache-2.0 | Tests only: clicking through the window without a screen |
 | [raw-window-handle](https://github.com/rust-windowing/raw-window-handle) | MIT OR Apache-2.0 OR Zlib | Passing that window to plugins |
 | [serde](https://github.com/serde-rs/serde) | MIT OR Apache-2.0 | Project files |
 | [serde_json](https://github.com/serde-rs/json) | MIT OR Apache-2.0 | Project files are JSON |

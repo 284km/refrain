@@ -19,6 +19,15 @@ Not allowed:
 Adding a license to the allow list is a policy change. Explain it in the
 commit that does it.
 
+## Fonts
+
+Font files come under licenses of their own. egui bundles fonts under the SIL
+Open Font License and the Ubuntu Font Licence, which are not on the allow
+list, so refrain turns off egui's default features and the GUI reads the
+system's fonts when it starts: Helvetica and Hiragino on macOS, Segoe UI and
+Yu Gothic on Windows. No font file is in the repository or in the program.
+`cargo deny` would catch egui's font crate if a change brought it back.
+
 ## Never in this repository
 
 | What | Why |

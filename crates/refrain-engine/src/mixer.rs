@@ -1,7 +1,9 @@
 //! Tracks, each an instrument and a chain of effects, mixed into one output
-//! and played through the master chain.
+//! and played through the master chain, and the transport that plays their
+//! sequences.
 
-use crate::{Processor, TimedEvent};
+use crate::timeline::{Click, merge};
+use crate::{ALL_NOTES_OFF, Event, MAX_BLOCK_EVENTS, Processor, SUSTAIN, Tempo, TimedEvent};
 
 /// The most channels a [`Mixer`] mixes. With more, it gives silence.
 ///
@@ -51,12 +53,17 @@ pub fn gain_from_db(db: f32) -> f32 {
     10f32.powf(db / 20.0)
 }
 
-/// An instrument followed by its effects, and how it goes into the mix.
+/// An instrument followed by its effects, how it goes into the mix, and the
+/// sequence played on the instrument.
 pub struct Track {
     // The instrument first. Each processor gets what the one before gave.
     chain: Vec<Box<dyn Processor>>,
     mix: Mix,
     buffer: Vec<f32>,
+    // Frames from the start of the timeline, in order.
+    sequence: Vec<(u64, Event)>,
+    next: usize,
+    block: Vec<TimedEvent>,
 }
 
 impl Track {
@@ -66,6 +73,37 @@ impl Track {
             chain,
             mix,
             buffer: Vec::new(),
+            sequence: Vec::new(),
+            next: 0,
+            block: Vec::with_capacity(MAX_BLOCK_EVENTS),
+        }
+    }
+
+    /// Plays `sequence`, events at frames from the start of the timeline, on
+    /// the instrument while the transport plays. It is sorted here.
+    pub fn with_sequence(mut self, mut sequence: Vec<(u64, Event)>) -> Self {
+        sequence.sort_by_key(|(frame, _)| *frame);
+        self.sequence = sequence;
+        self
+    }
+}
+
+/// What a stop or a jump sends every instrument, so that no note goes on
+/// sounding: the pedal up and All Notes Off, on every channel.
+const RELEASE_EVENTS: usize = 32;
+const _: () = assert!(RELEASE_EVENTS <= MAX_BLOCK_EVENTS);
+
+fn release(block: &mut Vec<TimedEvent>) {
+    for channel in 0..16 {
+        for number in [SUSTAIN, ALL_NOTES_OFF] {
+            block.push(TimedEvent {
+                frame: 0,
+                event: Event::Controller {
+                    channel,
+                    number,
+                    value: 0,
+                },
+            });
         }
     }
 }
@@ -75,12 +113,25 @@ impl Track {
 /// Live events go to the instrument of one track, the live track. Effects get
 /// no events. Muted tracks are still played, so their instruments and
 /// sequences stay in time; they are just not heard.
+///
+/// The mixer is also the transport. While it plays, the playhead moves and
+/// the tracks' sequences play; while it is stopped, the playhead stands
+/// still, and live events and the sound of the plugins go on. Stopping, or
+/// moving the playhead, releases every instrument's notes. All of this, and
+/// changes to the mix, may happen between any two blocks: none of it
+/// allocates.
 pub struct Mixer {
     tracks: Vec<Track>,
     master: Vec<Box<dyn Processor>>,
     master_gain: f32,
     live: Option<usize>,
     gains: Vec<(f32, f32)>,
+    playing: bool,
+    playhead: u64,
+    click: Option<Click>,
+    click_on: bool,
+    // Send every instrument the release events in the next block.
+    releasing: bool,
 }
 
 impl Mixer {
@@ -94,6 +145,11 @@ impl Mixer {
             master_gain: gain_from_db(master_volume_db),
             live: None,
             gains,
+            playing: true,
+            playhead: 0,
+            click: None,
+            click_on: false,
+            releasing: false,
         }
     }
 
@@ -101,6 +157,77 @@ impl Mixer {
     pub fn with_live_track(mut self, index: usize) -> Self {
         self.live = Some(index);
         self
+    }
+
+    /// Adds a metronome at `tempo`, accenting the first of every
+    /// `beats_per_bar` beats. It sounds while playing, on top of the mix.
+    pub fn with_click(mut self, tempo: Tempo, beats_per_bar: u32) -> Self {
+        self.click = Some(Click::new(tempo, beats_per_bar));
+        self.click_on = true;
+        self
+    }
+
+    /// Starts stopped, rather than playing.
+    pub fn stopped(mut self) -> Self {
+        self.playing = false;
+        self
+    }
+
+    /// Changes which track live events go to, releasing the old one's notes
+    /// at the next block.
+    pub fn set_live_track(&mut self, index: usize) {
+        if self.live != Some(index) {
+            self.live = Some(index);
+            self.releasing = true;
+        }
+    }
+
+    pub fn play(&mut self) {
+        self.playing = true;
+    }
+
+    /// Stops the playhead where it is, and releases every instrument's notes.
+    pub fn stop(&mut self) {
+        if self.playing {
+            self.playing = false;
+            self.releasing = true;
+        }
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    /// Moves the playhead to `frame` from the start of the timeline, and
+    /// releases every instrument's notes. Sequences go on from there.
+    pub fn locate(&mut self, frame: u64) {
+        self.playhead = frame;
+        for track in &mut self.tracks {
+            track.next = track.sequence.partition_point(|(f, _)| *f < frame);
+        }
+        self.releasing = true;
+    }
+
+    /// Frames from the start of the timeline to the playhead.
+    pub fn playhead(&self) -> u64 {
+        self.playhead
+    }
+
+    /// Turns the metronome on or off, if there is one.
+    pub fn set_click(&mut self, on: bool) {
+        self.click_on = on;
+    }
+
+    /// Changes how track `index` goes into the mix, from the next block.
+    pub fn set_mix(&mut self, index: usize, mix: Mix) {
+        if let Some(track) = self.tracks.get_mut(index) {
+            track.mix = mix;
+            self.gains[index] = mix.gains();
+        }
+    }
+
+    pub fn set_master_volume(&mut self, db: f32) {
+        self.master_gain = gain_from_db(db);
     }
 
     fn processors(&self) -> impl Iterator<Item = &Box<dyn Processor>> {
@@ -113,7 +240,13 @@ impl Mixer {
 
 impl Processor for Mixer {
     fn prepare(&mut self, sample_rate: f32, max_block_frames: usize) {
+        if let Some(click) = &mut self.click {
+            click.prepare(sample_rate);
+        }
+        self.playhead = 0;
+        self.releasing = false;
         for track in &mut self.tracks {
+            track.next = 0;
             track.buffer = vec![0.0; max_block_frames * MAX_CHANNELS];
             for p in &mut track.chain {
                 p.prepare(sample_rate, max_block_frames);
@@ -129,13 +262,31 @@ impl Processor for Mixer {
         if channels > MAX_CHANNELS {
             return;
         }
+        let frames = (out.len() / channels) as u64;
+        let start = self.playhead;
         let soloing = self.tracks.iter().any(|t| t.mix.solo);
         for (i, track) in self.tracks.iter_mut().enumerate() {
             let buffer = &mut track.buffer[..out.len()];
             buffer.fill(0.0);
             let live = if self.live == Some(i) { events } else { &[] };
+            track.block.clear();
+            if self.releasing {
+                release(&mut track.block);
+            }
+            if self.playing {
+                merge(
+                    &track.sequence,
+                    &mut track.next,
+                    start..start + frames,
+                    live,
+                    &mut track.block,
+                );
+            } else {
+                let room = MAX_BLOCK_EVENTS - track.block.len();
+                track.block.extend(live.iter().take(room));
+            }
             for (k, p) in track.chain.iter_mut().enumerate() {
-                p.process(buffer, channels, if k == 0 { live } else { &[] });
+                p.process(buffer, channels, if k == 0 { &track.block } else { &[] });
             }
             if track.mix.mute || (soloing && !track.mix.solo) {
                 continue;
@@ -165,6 +316,13 @@ impl Processor for Mixer {
                 *s *= self.master_gain;
             }
         }
+        if self.playing {
+            if let (Some(click), true) = (&self.click, self.click_on) {
+                click.add(out, channels, start);
+            }
+            self.playhead = start + frames;
+        }
+        self.releasing = false;
     }
 
     fn has_failed(&self) -> bool {
@@ -174,8 +332,8 @@ impl Processor for Mixer {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::{Event, Sine, render_offline};
@@ -379,6 +537,163 @@ mod tests {
         assert_eq!(counts, [0, 5, 0, 0]);
     }
 
+    /// Writes down the events it is given, at frames counted from its first
+    /// block.
+    struct Log(Arc<Mutex<Vec<(u64, Event)>>>, u64);
+
+    impl Processor for Log {
+        fn prepare(&mut self, _: f32, _: usize) {
+            self.1 = 0;
+        }
+        fn process(&mut self, out: &mut [f32], channels: usize, events: &[TimedEvent]) {
+            let mut log = self.0.lock().unwrap();
+            log.extend(
+                events
+                    .iter()
+                    .map(|e| (self.1 + u64::from(e.frame), e.event)),
+            );
+            self.1 += (out.len() / channels) as u64;
+        }
+    }
+
+    type Shared = Arc<Mutex<Vec<(u64, Event)>>>;
+
+    fn logged(sequence: Vec<(u64, Event)>) -> (Track, Shared) {
+        let log = Shared::default();
+        let track = track(vec![Box::new(Log(Arc::clone(&log), 0))]).with_sequence(sequence);
+        (track, log)
+    }
+
+    fn note(key: u8) -> Event {
+        Event::NoteOn {
+            channel: 0,
+            key,
+            velocity: 1.0,
+        }
+    }
+
+    fn is_release(e: &Event) -> bool {
+        matches!(e, Event::Controller { number, .. } if *number == SUSTAIN || *number == ALL_NOTES_OFF)
+    }
+
+    /// Runs `blocks` blocks of `frames` frames.
+    fn run(mixer: &mut Mixer, frames: usize, blocks: usize) {
+        let mut out = vec![0.0; frames * 2];
+        for _ in 0..blocks {
+            mixer.process(&mut out, 2, &[]);
+        }
+    }
+
+    #[test]
+    fn sequences_play_on_their_own_tracks_at_their_frames() {
+        for block in [1, 7, 128] {
+            let (a, log_a) = logged(vec![(5, note(60)), (300, note(62))]);
+            let (b, log_b) = logged(vec![(0, note(70)), (299, note(71))]);
+            let mut mixer = Mixer::new(vec![a, b], Vec::new(), 0.0).with_live_track(0);
+            let live = [TimedEvent {
+                frame: 5,
+                event: note(1),
+            }];
+            render_offline(&mut mixer, RATE, 2, 400, block, &live);
+            // At a frame, live events go after sequenced ones.
+            assert_eq!(
+                *log_a.lock().unwrap(),
+                [(5, note(60)), (5, note(1)), (300, note(62))],
+                "block size {block}"
+            );
+            assert_eq!(*log_b.lock().unwrap(), [(0, note(70)), (299, note(71))]);
+            assert_eq!(mixer.playhead(), 400);
+        }
+    }
+
+    #[test]
+    fn stopping_holds_the_playhead_and_releases_notes() {
+        let (a, log) = logged(vec![(150, note(60))]);
+        let mut mixer = Mixer::new(vec![a], Vec::new(), 0.0);
+        mixer.prepare(RATE, 128);
+        run(&mut mixer, 100, 1);
+        mixer.stop();
+        run(&mut mixer, 100, 3);
+        assert_eq!(mixer.playhead(), 100);
+        {
+            let log = log.lock().unwrap();
+            // Released once, at the first stopped block; the note waits.
+            assert_eq!(log.len(), RELEASE_EVENTS);
+            assert!(log.iter().all(|(frame, e)| *frame == 100 && is_release(e)));
+        }
+        mixer.play();
+        run(&mut mixer, 100, 1);
+        // The note at 150 on the timeline comes 50 frames into this block,
+        // which the instrument counts as 450.
+        assert_eq!(log.lock().unwrap().last(), Some(&(450, note(60))));
+    }
+
+    #[test]
+    fn locating_skips_ahead_and_releases_notes() {
+        let (a, log) = logged(vec![(10, note(60)), (1_000, note(62)), (1_050, note(64))]);
+        let mut mixer = Mixer::new(vec![a], Vec::new(), 0.0);
+        mixer.prepare(RATE, 128);
+        mixer.locate(1_000);
+        run(&mut mixer, 100, 1);
+        let log = log.lock().unwrap();
+        let notes: Vec<_> = log.iter().filter(|(_, e)| !is_release(e)).collect();
+        assert_eq!(notes, [&(0, note(62)), &(50, note(64))]);
+        assert_eq!(
+            log.iter().filter(|(_, e)| is_release(e)).count(),
+            RELEASE_EVENTS
+        );
+        assert_eq!(mixer.playhead(), 1_100);
+    }
+
+    #[test]
+    fn live_events_play_while_stopped() {
+        let (a, log) = logged(vec![(0, note(60))]);
+        let mut mixer = Mixer::new(vec![a], Vec::new(), 0.0)
+            .with_live_track(0)
+            .stopped();
+        mixer.prepare(RATE, 128);
+        let mut out = vec![0.0; 256];
+        mixer.process(
+            &mut out,
+            2,
+            &[TimedEvent {
+                frame: 3,
+                event: note(1),
+            }],
+        );
+        assert_eq!(*log.lock().unwrap(), [(3, note(1))]);
+        assert_eq!(mixer.playhead(), 0);
+    }
+
+    #[test]
+    fn the_click_sounds_only_while_playing() {
+        let click = || {
+            Mixer::new(vec![track(vec![Box::new(Level(0.0))])], Vec::new(), 0.0)
+                .with_click(Tempo::new(120.0), 4)
+        };
+        let heard = |mixer: &mut Mixer| {
+            let out = render_offline(mixer, RATE, 2, 1_000, 128, &[]);
+            out.iter().any(|&s| s != 0.0)
+        };
+        assert!(heard(&mut click()));
+        assert!(!heard(&mut click().stopped()));
+        let mut off = click();
+        off.set_click(false);
+        assert!(!heard(&mut off));
+    }
+
+    #[test]
+    fn changing_the_live_track_releases_the_old_ones_notes() {
+        let (a, log_a) = logged(Vec::new());
+        let (b, log_b) = logged(Vec::new());
+        let mut mixer = Mixer::new(vec![a, b], Vec::new(), 0.0).with_live_track(0);
+        mixer.prepare(RATE, 128);
+        mixer.set_live_track(1);
+        run(&mut mixer, 10, 1);
+        assert_eq!(log_a.lock().unwrap().len(), RELEASE_EVENTS);
+        assert_eq!(log_b.lock().unwrap().len(), RELEASE_EVENTS);
+    }
+
     #[test]
     fn a_muted_track_keeps_playing_unheard() {
         // A muted sine that is unmuted later picks up where it would be.
@@ -392,8 +707,7 @@ mod tests {
         let mut out = vec![1.0; 256];
         a.process(&mut out, 2, &[]);
         assert!(out.iter().all(|&s| s == 0.0));
-        a.tracks[0].mix.mute = false;
-        a.gains[0] = a.tracks[0].mix.gains();
+        a.set_mix(0, Mix::default());
         a.process(&mut out, 2, &[]);
         let reference = render_offline(&mut Sine::new(440.0, 0.5), RATE, 2, 256, 128, &[]);
         assert_eq!(out, reference[256..]);

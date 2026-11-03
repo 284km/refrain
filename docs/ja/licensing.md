@@ -17,6 +17,14 @@ CI で `cargo deny check` が [`deny.toml`](../../deny.toml) の一覧を使っ�
 
 許可するライセンスを一覧に足すのは方針の変更です。足す commit で理由を説明してください。
 
+## フォント
+
+フォントのファイルには、それぞれ独自のライセンスがあります。egui が同梱するフォントは SIL Open
+Font License と Ubuntu Font Licence で、許可するライセンスの一覧に入っていません。そこで refrain は
+egui の既定の機能を外し、GUI は起動するときに OS のフォントを読みます。macOS では Helvetica と
+ヒラギノ、Windows では Segoe UI と Yu Gothic です。フォントのファイルは、リポジトリにもプログラムにも
+入っていません。変更で egui のフォントの crate が戻ってきたら、`cargo deny` が捕まえます。
+
 ## このリポジトリに決して入れないもの
 
 | もの | 理由 |

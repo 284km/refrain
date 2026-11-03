@@ -76,6 +76,16 @@ and runs the sum through the master's chain of effects and the master volume.
   channels; with more, the mixer gives silence rather than allocate on the
   audio thread.
 
+The mixer is also the transport. Each track holds its sequence, events at
+frames of the timeline, and the mixer plays them while it plays. Stopped, the
+playhead stands still, while live events and the plugins' own sound go on.
+Stopping, moving the playhead, or changing the live track sends every
+instrument the sustain pedal up and All Notes Off on all 16 channels, so no
+note is left sounding. The metronome is part of the mixer too, on top of the
+master and only while playing. `play`, `stop`, `locate`, `set_mix`,
+`set_master_volume`, `set_click` and `set_live_track` may be called between
+any two blocks, and none of them allocates.
+
 `deinterleave` is the other way round from `interleave`: it turns the
 interleaved signal into a plugin's channels for its input. A mono signal goes
 to every input channel, a mono plugin gets a mixdown, and input channels the
@@ -123,6 +133,11 @@ Hosts CLAP plugins, using [`clack-host`](https://github.com/prokopyl/clack).
 - The audio stream has to stop before the `ClapPlugin` is dropped. If the
   processor is still alive at that point, clack leaks the instance instead of
   destroying it under the audio thread.
+- Dropping a `ClapProcessor` stops processing, as CLAP asks before a plugin
+  is deactivated, and the next `activate` deactivates the plugin first. So a
+  plugin can be activated again, at another block size or after the tracks
+  changed, once its last processor is gone; with that one still alive,
+  `activate` refuses.
 
 ### `refrain-vst3`
 
@@ -147,6 +162,9 @@ bindings.
   that refrain implements. They are allocated at activation and reused.
 - As with CLAP, the stream has to stop before the `Vst3Plugin` is dropped;
   otherwise the plugin is leaked rather than torn down under the audio thread.
+- Dropping a `Vst3Processor` calls `setProcessing(0)`, and the next
+  `activate` calls `setActive(0)` first, so a VST3 plugin too can be
+  activated again once its last processor is gone.
 
 ### Plugin editors
 
@@ -259,8 +277,8 @@ asked for, is triangular noise of one step from a fixed seed, so the same
 project always gives the same file.
 
 A `Session` is a project with all its plugins loaded and their states given
-back. It builds the `Mixer` for playing or rendering, with each track's
-instrument wrapped in a `Sequencer` that plays the track's clips, and saves
+back. It builds the `Mixer` for playing or rendering, giving each track its
+clips as a sequence, and saves
 every plugin's state back into the project. A single plugin file opens as a
 project of one track. `new`, `show`, `track`, `fx` and `mix` change a project
 file without playing it; they load a plugin only to learn its format, ID and
@@ -269,6 +287,32 @@ name.
 The device callback splits the device's buffer into blocks of at most
 `MAX_BLOCK_FRAMES`, runs the engine into an `f32` buffer and converts it to
 the device's sample type.
+
+### refrain's window
+
+`refrain gui` opens a window with the transport, a row for every track (its
+header with the mix and the plugins, and a lane with its clips), and the
+master. It is drawn by [egui](https://github.com/emilk/egui) through `wgpu`,
+in the same `winit` event loop as the plugins' editor windows, which open
+from the plugins' buttons.
+
+- **What is shown and what is done are kept apart.** `view::show` draws a
+  `Model`, a plain copy of what the window shows, and returns the `Action`s
+  the person took. It changes nothing. Tests click through it with
+  `egui_kittest`, without a screen, a device or plugins.
+- **The audio thread is reached through a queue.** The mixer runs inside a
+  `Remote`, which applies commands from an `rtrb` queue before each block
+  (play, stop, locate, a track's mix, the master volume, the click, the live
+  track) and publishes the playhead through atomics. Mix changes are heard
+  from the next block, while playing.
+- **Changes to what plays rebuild the mixer.** A new clip or a new tempo
+  stops the stream, activates every plugin again and starts it at the same
+  playhead. It takes a moment, so it only happens while stopped.
+- **Recording** starts playing at the playhead and collects what comes in
+  from MIDI, stamped by the MIDI thread. Stopping turns it into a clip that
+  starts where the recording began, on the track MIDI goes to.
+- **Fonts come from the system**, as the licensing policy explains. Without
+  any of the fonts it looks for, the window does not open.
 
 ## Known limits
 
@@ -293,10 +337,15 @@ the device's sample type.
   sample rate conversion, no normalizing, and no rendering of single tracks
   (stems). A plugin with a hard real-time requirement is still rendered
   offline.
-- **The mix is fixed while playing.** Tracks, effects and the mix are set
-  before playing starts; changing them means starting again. There are no
-  sends, buses or groups, no automation, and effects get no MIDI and no side
-  chain.
+- **Tracks and effects are fixed while playing.** The mix can change while
+  playing in refrain's window, but adding a track or an effect, or a new
+  clip, means activating the plugins again, which refrain does while
+  stopped. There are no sends, buses or groups, no automation, and effects
+  get no MIDI and no side chain.
+- **refrain's window** cannot add or remove tracks and effects, open another
+  project, or edit clips yet; the project commands do the first two. Its
+  timeline always fits the whole song, without zooming or scrolling
+  sideways.
 - **Projects are saved when the editor closes or `play` ends**, with `--save`.
   There is no saving while playing, and no autosave.
 - **A project whose plugin has moved** is not found by ID in the installed
@@ -331,7 +380,10 @@ device:
   instead of its input (in both hosts), running a chain backwards, swapping
   the sides of the pan, and not passing a project's mix to the mixer. For
   rendering: setting a VST3 plugin up offline but running its blocks in real
-  time, and telling a CLAP plugin real time when offline was asked for. The pan
+  time, and telling a CLAP plugin real time when offline was asked for. For
+  the transport: stopping without releasing the instruments' notes, moving
+  the playhead while stopped, and moving the playhead without moving the
+  sequences along. The pan
   swap first passed the engine's tests, whose levels added up the same with
   the sides swapped; the levels were changed so they no longer do. CI's mix
   check caught it, and the mix not being passed on, from the peaks of each

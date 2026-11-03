@@ -571,3 +571,18 @@ fn offline_rendering_is_set_up_and_sounds_the_same() {
         }
     }
 }
+
+#[test]
+fn a_plugin_can_be_activated_again_once_its_processor_is_gone() {
+    let module = module();
+    let mut plugin = Vst3Plugin::new(&module, Some(NAME)).unwrap();
+    let mut first = plugin.activate(RATE, 1_024).unwrap();
+    let a = render_offline(&mut first, RATE, 2, FRAMES, 128, &chord());
+    let err = plugin.activate(RATE, 1_024).err().unwrap();
+    assert!(matches!(err, Vst3Error::StillProcessing), "{err}");
+    drop(first);
+    let mut second = plugin.activate(RATE, 256).unwrap();
+    let b = render_offline(&mut second, RATE, 2, FRAMES, 256, &chord());
+    assert!(!second.has_failed());
+    assert_eq!(a, b);
+}

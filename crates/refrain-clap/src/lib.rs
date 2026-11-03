@@ -70,6 +70,9 @@ pub enum ClapError {
     Ambiguous(Vec<String>),
     NotFound(String),
     NoAudioOutput,
+    /// Activating again while the processor from the last activation is
+    /// still alive.
+    StillProcessing,
     /// Opening the editor failed at the named step.
     Editor(&'static str),
     /// Saving or loading the plugin's state failed.
@@ -90,6 +93,9 @@ impl fmt::Display for ClapError {
             ),
             Self::NotFound(id) => write!(f, "the CLAP file holds no plugin with id {id}"),
             Self::NoAudioOutput => f.write_str("the plugin has no audio output"),
+            Self::StillProcessing => {
+                f.write_str("the plugin is still processing; stop it before activating it again")
+            }
             Self::Editor(step) => write!(f, "the plugin's editor failed to {step}"),
             Self::State(step) => write!(f, "the plugin's state failed to {step}"),
             Self::Instance(e) => write!(f, "{e}"),
@@ -547,6 +553,12 @@ impl ClapPlugin {
             min_frames_count: 1,
             max_frames_count: max_block_frames as u32,
         };
+        if self.instance.is_active() {
+            // Activated before: its processor must be gone by now.
+            self.instance
+                .try_deactivate()
+                .map_err(|_| ClapError::StillProcessing)?;
+        }
         let stopped = self.instance.activate(|_, _| (), config)?;
 
         let alloc = |channels: &[u32]| -> Vec<Vec<f32>> {
@@ -556,7 +568,7 @@ impl ClapPlugin {
                 .collect()
         };
         Ok(ClapProcessor {
-            processor: stopped.into(),
+            processor: Some(stopped.into()),
             sample_rate,
             max_block_frames,
             input_ports: AudioPorts::with_capacity(
@@ -634,7 +646,8 @@ fn find_note_port(handle: &PluginMainThreadHandle) -> Option<NotePort> {
 
 /// A running plugin, owned by the audio thread.
 pub struct ClapProcessor {
-    processor: PluginAudioProcessor<RefrainHost>,
+    // Always there until the processor is dropped.
+    processor: Option<PluginAudioProcessor<RefrainHost>>,
     sample_rate: f32,
     max_block_frames: usize,
     input_ports: AudioPorts,
@@ -712,6 +725,15 @@ fn push_note(buffer: &mut EventBuffer, port: u16, e: &TimedEvent) {
     }
 }
 
+impl Drop for ClapProcessor {
+    fn drop(&mut self) {
+        // CLAP asks for processing to stop before the plugin is deactivated.
+        if let Some(processor) = self.processor.take() {
+            drop(processor.into_stopped());
+        }
+    }
+}
+
 impl Processor for ClapProcessor {
     fn prepare(&mut self, sample_rate: f32, max_block_frames: usize) {
         // The plugin was activated for these on the main thread; it cannot be
@@ -770,7 +792,11 @@ impl Processor for ClapProcessor {
                 }
             }));
 
-        let result = self.processor.ensure_processing_started().and_then(|p| {
+        let Some(processor) = self.processor.as_mut() else {
+            out.fill(0.0);
+            return;
+        };
+        let result = processor.ensure_processing_started().and_then(|p| {
             p.process(
                 &ins,
                 &mut outs,

@@ -92,29 +92,14 @@ impl<P: Processor> Processor for Sequencer<P> {
     fn process(&mut self, out: &mut [f32], channels: usize, live: &[TimedEvent]) {
         let frames = (out.len() / channels) as u64;
         let end = self.playhead + frames;
-        // Merge the sequence's events in this block with the live ones, in
-        // order of frame. Live events go after sequenced ones at a frame.
         self.block.clear();
-        let mut live = live.iter().peekable();
-        while self.block.len() < MAX_BLOCK_EVENTS {
-            let sequenced = self
-                .sequence
-                .get(self.next)
-                .filter(|(frame, _)| *frame < end)
-                .map(|&(frame, event)| TimedEvent {
-                    frame: (frame - self.playhead) as u32,
-                    event,
-                });
-            match (sequenced, live.peek()) {
-                (Some(s), Some(l)) if l.frame < s.frame => self.block.push(*live.next().unwrap()),
-                (Some(s), _) => {
-                    self.block.push(s);
-                    self.next += 1;
-                }
-                (None, Some(_)) => self.block.push(*live.next().unwrap()),
-                (None, None) => break,
-            }
-        }
+        merge(
+            &self.sequence,
+            &mut self.next,
+            self.playhead..end,
+            live,
+            &mut self.block,
+        );
         self.inner.process(out, channels, &self.block);
         if let Some(click) = &mut self.click {
             click.add(out, channels, self.playhead);
@@ -127,9 +112,42 @@ impl<P: Processor> Processor for Sequencer<P> {
     }
 }
 
+/// Adds to `block` the events of `sequence` from `next` that fall in
+/// `frames`, merged with `live` in order of frame, up to
+/// [`MAX_BLOCK_EVENTS`] in all. Live events go after sequenced ones at a
+/// frame. Sequenced events that do not fit wait for the next block, and come
+/// at its start.
+pub(crate) fn merge(
+    sequence: &[(u64, Event)],
+    next: &mut usize,
+    frames: std::ops::Range<u64>,
+    live: &[TimedEvent],
+    block: &mut Vec<TimedEvent>,
+) {
+    let mut live = live.iter().peekable();
+    while block.len() < MAX_BLOCK_EVENTS {
+        let sequenced = sequence
+            .get(*next)
+            .filter(|(frame, _)| *frame < frames.end)
+            .map(|&(frame, event)| TimedEvent {
+                frame: frame.saturating_sub(frames.start) as u32,
+                event,
+            });
+        match (sequenced, live.peek()) {
+            (Some(s), Some(l)) if l.frame < s.frame => block.push(*live.next().unwrap()),
+            (Some(s), _) => {
+                block.push(s);
+                *next += 1;
+            }
+            (None, Some(_)) => block.push(*live.next().unwrap()),
+            (None, None) => break,
+        }
+    }
+}
+
 /// A metronome: a short, decaying sine on every beat, higher on the first
 /// beat of a bar. Its sound is added to the output, and never recorded.
-struct Click {
+pub(crate) struct Click {
     tempo: Tempo,
     beats_per_bar: u32,
     sample_rate: f32,
@@ -140,7 +158,7 @@ const CLICK_SECONDS: f32 = 0.03;
 const CLICK_LEVEL: f32 = 0.25;
 
 impl Click {
-    fn new(tempo: Tempo, beats_per_bar: u32) -> Self {
+    pub(crate) fn new(tempo: Tempo, beats_per_bar: u32) -> Self {
         Self {
             tempo,
             beats_per_bar: beats_per_bar.max(1),
@@ -148,11 +166,11 @@ impl Click {
         }
     }
 
-    fn prepare(&mut self, sample_rate: f32) {
+    pub(crate) fn prepare(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate;
     }
 
-    fn add(&self, out: &mut [f32], channels: usize, start: u64) {
+    pub(crate) fn add(&self, out: &mut [f32], channels: usize, start: u64) {
         let rate = f64::from(self.sample_rate);
         let beat_frames = self.tempo.seconds_per_beat() * rate;
         let length = (CLICK_SECONDS * self.sample_rate) as u64;
@@ -246,6 +264,25 @@ impl Recording {
 mod tests {
     use super::*;
     use crate::render_offline;
+
+    #[test]
+    fn more_events_than_a_block_holds_wait_for_the_next_block() {
+        let on = Event::NoteOn {
+            channel: 0,
+            key: 60,
+            velocity: 1.0,
+        };
+        let sequence: Vec<(u64, Event)> = (0..300).map(|_| (10, on)).collect();
+        let mut next = 0;
+        let mut block = Vec::new();
+        merge(&sequence, &mut next, 0..128, &[], &mut block);
+        assert_eq!((block.len(), next), (MAX_BLOCK_EVENTS, MAX_BLOCK_EVENTS));
+        block.clear();
+        // Late, so at the start of the next block rather than before it.
+        merge(&sequence, &mut next, 128..256, &[], &mut block);
+        assert_eq!(block.len(), 300 - MAX_BLOCK_EVENTS);
+        assert!(block.iter().all(|e| e.frame == 0));
+    }
 
     const RATE: f32 = 48_000.0;
 

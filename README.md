@@ -7,8 +7,9 @@ A DAW for macOS and Windows, written in Rust.
 > Status: very early. refrain hosts CLAP and VST3 instruments and effects,
 > plays them from a MIDI input on an audio device or offline into a WAV file,
 > records MIDI clips, and mixes tracks, each an instrument with a chain of
-> effects, through a master chain. Plugin editors open in a window. refrain
-> has no GUI of its own yet, only the `refrain` command.
+> effects, through a master chain. Plugin editors open in a window, and
+> `refrain gui` opens refrain's own window with the transport, the tracks
+> and the mix.
 
 ## Goals
 
@@ -122,6 +123,22 @@ cargo run -- render band-cd.wav --plugin band.refrain --bits 16 --dither --rate 
 An installed instrument or effect works the same way: pass its `.clap` or `.vst3`
 file or bundle. When a file holds several plugins, `--id` chooses one
 (for VST3, by name or class ID). Loading a plugin runs its code inside refrain.
+
+## refrain's window
+
+`refrain gui` opens refrain's own window on a project: the transport, a row
+for every track with its mix and its clips, and the master. Play, stop, click
+the timeline to move the playhead, and record onto the track marked MIDI;
+volume, pan, mute and solo change what you hear as you move them. A plugin's
+button opens its editor. Save writes the project back.
+
+```sh
+cargo run -- gui band.refrain
+cargo run -- gui target/test-plugins/refrain-test-synth.clap --save new.refrain
+```
+
+Adding and removing tracks and effects is still done with the project
+commands above.
 
 ## Documentation
 

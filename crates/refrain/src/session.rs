@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use refrain_engine::{Event, Mixer, Processor, Sequencer, Tempo, Track as MixerTrack};
+use refrain_engine::{Event, Mixer, Processor, Tempo, Track as MixerTrack};
 use refrain_project::{Plugin as Stored, Project, State};
 
 use crate::Result;
@@ -197,7 +197,8 @@ impl Session {
 
     /// Activates every plugin and puts them together: each track's
     /// instrument, playing the track's clips, then its effects, mixed, then
-    /// the master's effects. Live events go to track `live`, and so do
+    /// the master's effects. Plugins activated before are activated again,
+    /// so the last mixer has to be gone. Live events go to track `live`, and so do
     /// `extra` events, at frames from the start.
     pub fn mixer(
         &mut self,
@@ -217,13 +218,12 @@ impl Session {
             if t == live {
                 sequence.extend_from_slice(extra);
             }
-            let instrument = loaded.instrument.activate(sample_rate, max_block_frames)?;
             let mut chain: Vec<Box<dyn Processor>> =
-                vec![Box::new(Sequencer::new(instrument, sequence))];
+                vec![loaded.instrument.activate(sample_rate, max_block_frames)?];
             for effect in &mut loaded.effects {
                 chain.push(effect.activate(sample_rate, max_block_frames)?);
             }
-            tracks.push(MixerTrack::new(chain, track.mix.to_engine()));
+            tracks.push(MixerTrack::new(chain, track.mix.to_engine()).with_sequence(sequence));
         }
         let master = self
             .master
@@ -233,9 +233,10 @@ impl Session {
         Ok(Mixer::new(tracks, master, self.project.master.volume_db).with_live_track(live))
     }
 
-    /// Adds a clip at the start of track `track`, holding `events` at ticks.
-    pub fn add_clip(&mut self, track: usize, events: &[(u64, Event)]) {
-        self.project.tracks[track].add_clip(0, events);
+    /// Adds a clip to track `track` at tick `start`, holding `events` at
+    /// ticks from there.
+    pub fn add_clip(&mut self, track: usize, start: u64, events: &[(u64, Event)]) {
+        self.project.tracks[track].add_clip(start, events);
     }
 
     /// Writes the project, with every plugin's current state, to `file`.

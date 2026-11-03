@@ -1,10 +1,11 @@
 //! The `refrain` command.
 //!
-//! For now this is a command-line front end that proves the engine and plugin
-//! hosting work on a real device and offline. The GUI comes later.
+//! Commands that play, record, render and change projects, and `refrain gui`,
+//! which opens refrain's own window.
 
 mod audio;
 mod editor;
+mod gui;
 mod midi;
 mod plugin;
 mod project;
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use refrain_engine::{
-    Event, Processor, Recording, SUSTAIN, Sequencer, Sine, Tail, render_offline, render_until_quiet,
+    Event, Processor, Recording, SUSTAIN, Sine, Tail, render_offline, render_until_quiet,
 };
 
 use audio::Output;
@@ -42,6 +43,8 @@ usage:
   refrain record <plugin> [options]     like play, and record what comes in from MIDI
                                         as a new clip; needs --save, or a project
   refrain editor <plugin> [options]     open a plugin's editor, without audio
+  refrain gui <project> [options]       open refrain's window on a project, or on a
+                                        plugin; --save says where to save
   refrain render <out.wav> [options]    write a sine wave, or with --plugin a
                                         project's clips or else a short phrase, to
                                         a WAV file: until the sound dies away, and
@@ -75,6 +78,7 @@ options:
                      mute a track, or solo it (mix)
   --demo             play the short phrase instead of reading MIDI (play)
   --no-editor        do not open the plugin's editor (play)
+  --play             start playing as soon as the window opens (gui)
   --save <project>   when done, save the project with every plugin's state and
                      the clips (play, record, editor)
   --tempo <bpm>      beats per minute (default: the project's, or 120; new)
@@ -149,6 +153,7 @@ fn run(args: &[String]) -> Result<()> {
         ["record", path] => record(path, &o),
         ["editor", path] => editor_only(path, &o),
         ["render", path] => render(path, &o),
+        ["gui", path] => gui::run(Path::new(path), &o),
         ["new", path] => project::new(Path::new(path), &o),
         ["show", path] => project::show(Path::new(path)),
         ["track", "add", path, plugin] => {
@@ -189,6 +194,7 @@ pub(crate) struct Options {
     pub(crate) mute: Option<bool>,
     pub(crate) solo: Option<bool>,
     demo: bool,
+    pub(crate) play: bool,
     no_editor: bool,
     pub(crate) tempo: Option<f64>,
     click: bool,
@@ -219,6 +225,7 @@ impl Options {
             mute: None,
             solo: None,
             demo: false,
+            play: false,
             no_editor: false,
             tempo: None,
             click: false,
@@ -235,6 +242,10 @@ impl Options {
         while let Some(flag) = it.next() {
             if flag == "--demo" {
                 o.demo = true;
+                continue;
+            }
+            if flag == "--play" {
+                o.play = true;
                 continue;
             }
             if flag == "--no-editor" {
@@ -470,12 +481,11 @@ fn perform(path: &str, o: &Options, recording: bool) -> Result<()> {
     let tempo = session.tempo();
     let output = Output::open(o.device.as_deref())?;
     let rate = output.sample_rate();
-    let mixer = session.mixer(rate, refrain_engine::MAX_BLOCK_FRAMES, live, &[])?;
+    let mut mixer = session.mixer(rate, refrain_engine::MAX_BLOCK_FRAMES, live, &[])?;
     // The click goes on top of the mix, so no track's effects change it.
-    let mut sequencer = Sequencer::new(mixer, Vec::new());
     let click = if recording { !o.no_click } else { o.click };
     if click {
-        sequencer = sequencer.with_click(tempo, 4);
+        mixer = mixer.with_click(tempo, 4);
     }
     println!(
         "MIDI goes to track {}: {}",
@@ -515,7 +525,7 @@ fn perform(path: &str, o: &Options, recording: bool) -> Result<()> {
         }
     }
 
-    let stream = output.start(sequencer, Some(from_notes))?;
+    let stream = output.start(mixer, Some(from_notes))?;
     // The timeline and the recording both start now.
     let start = Instant::now();
     let stop = Arc::new(AtomicBool::new(false));
@@ -585,7 +595,7 @@ fn perform(path: &str, o: &Options, recording: bool) -> Result<()> {
                 events.len(),
                 live + 1
             );
-            session.add_clip(live, &events);
+            session.add_clip(live, 0, &events);
         }
     }
     if let Some(project) = &save {

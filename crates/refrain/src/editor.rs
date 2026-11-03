@@ -10,7 +10,6 @@ use winit::raw_window_handle::HasWindowHandle;
 use winit::window::{Window, WindowId};
 
 use crate::Result;
-use crate::plugin::Kind;
 use crate::session::{Session, Slot};
 
 /// Editor sizes are in points on macOS and in pixels elsewhere, in both
@@ -34,6 +33,99 @@ fn editor_size(size: PhysicalSize<u32>, scale: f64) -> (u32, u32) {
     }
 }
 
+/// A window holding the editor of one plugin of a session.
+pub struct EditorWindow {
+    pub slot: Slot,
+    window: Window,
+}
+
+impl EditorWindow {
+    /// Opens the editor of the plugin in `slot` in a new window. `None` when
+    /// the plugin has no editor that can be embedded.
+    pub fn open(
+        event_loop: &ActiveEventLoop,
+        session: &mut Session,
+        slot: Slot,
+        title: &str,
+    ) -> Result<Option<Self>> {
+        let attributes = Window::default_attributes()
+            .with_title(title)
+            .with_visible(false)
+            .with_resizable(false)
+            .with_inner_size(window_size(640, 480));
+        let window = event_loop.create_window(attributes)?;
+        let parent = window.window_handle()?.as_raw();
+        let plugin = session.plugin(slot)?;
+        // SAFETY: the window outlives the editor; `close` closes the editor
+        // before the window is dropped.
+        let Some(size) = unsafe { plugin.open_editor(parent, window.scale_factor()) }? else {
+            return Ok(None);
+        };
+        let resizable = if size.resizable { ", resizable" } else { "" };
+        // A plugin that accepted the window but put nothing in it shows an
+        // empty window; say so rather than leave it a mystery.
+        let embedded = match has_children(parent) {
+            Some(true) => ", embedded",
+            Some(false) => ", but the plugin put nothing in the window",
+            None => "",
+        };
+        println!(
+            "editor: {} x {}{resizable}{embedded}",
+            size.width, size.height
+        );
+        window.set_resizable(size.resizable);
+        let _ = window.request_inner_size(window_size(size.width, size.height));
+        window.set_visible(true);
+        Ok(Some(Self { slot, window }))
+    }
+
+    pub fn id(&self) -> WindowId {
+        self.window.id()
+    }
+
+    /// Handles an event for this window. Returns false once the window is to
+    /// close.
+    pub fn on_event(&mut self, session: &mut Session, event: &WindowEvent) -> bool {
+        let Ok(plugin) = session.plugin(self.slot) else {
+            return false;
+        };
+        match event {
+            WindowEvent::CloseRequested => false,
+            WindowEvent::Resized(size) => {
+                let (w, h) = editor_size(*size, self.window.scale_factor());
+                let (aw, ah) = plugin.resize_editor(w, h);
+                // Only push back when the editor insists on a clearly
+                // different size, so rounding cannot start a resize loop.
+                if aw.abs_diff(w) > 1 || ah.abs_diff(h) > 1 {
+                    let _ = self.window.request_inner_size(window_size(aw, ah));
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// Follows the editor's requests. Returns false once the plugin has
+    /// closed its editor.
+    pub fn poll(&mut self, session: &mut Session) -> bool {
+        let Ok(plugin) = session.plugin(self.slot) else {
+            return false;
+        };
+        if let Some((w, h)) = plugin.take_editor_resize_request() {
+            let _ = self.window.request_inner_size(window_size(w, h));
+        }
+        !plugin.editor_closed()
+    }
+
+    /// Closes the editor, then the window it lives in.
+    pub fn close(self, session: &mut Session) {
+        if let Ok(plugin) = session.plugin(self.slot) {
+            plugin.close_editor();
+        }
+        drop(self.window);
+    }
+}
+
 /// Opens the editor of the plugin in `slot` in a window, and runs until the
 /// window closes or `tick` returns false. `tick` runs every few milliseconds
 /// on the main thread.
@@ -53,14 +145,14 @@ pub fn run(
         slot,
         title,
         tick,
-        window: None,
+        editor: None,
         opened: None,
         error: None,
     };
     event_loop.run_app(&mut app)?;
-    // The editor goes before the window it lives in.
-    app.plugin().close_editor();
-    app.window.take();
+    if let Some(editor) = app.editor.take() {
+        editor.close(app.session);
+    }
     match app.error {
         Some(e) => Err(e),
         None => Ok(app.opened.unwrap_or(false)),
@@ -72,103 +164,55 @@ struct App<'a> {
     slot: Slot,
     title: &'a str,
     tick: &'a mut dyn FnMut(&mut Session) -> bool,
-    window: Option<Window>,
+    editor: Option<EditorWindow>,
     opened: Option<bool>,
     error: Option<Box<dyn std::error::Error>>,
 }
 
 impl App<'_> {
-    fn plugin(&mut self) -> &mut Kind {
-        self.session
-            .plugin(self.slot)
-            .expect("run checked the slot")
-    }
-
-    fn open(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
-        let attributes = Window::default_attributes()
-            .with_title(self.title)
-            .with_visible(false)
-            .with_resizable(false)
-            .with_inner_size(window_size(640, 480));
-        let window = event_loop.create_window(attributes)?;
-        let parent = window.window_handle()?.as_raw();
-        // SAFETY: the window outlives the editor; `run` closes the editor
-        // before dropping the window.
-        let size = unsafe { self.plugin().open_editor(parent, window.scale_factor()) }?;
-        match size {
-            Some(size) => {
-                let resizable = if size.resizable { ", resizable" } else { "" };
-                // A plugin that accepted the window but put nothing in it
-                // shows an empty window; say so rather than leave it a mystery.
-                let embedded = match has_children(parent) {
-                    Some(true) => ", embedded",
-                    Some(false) => ", but the plugin put nothing in the window",
-                    None => "",
-                };
-                println!(
-                    "editor: {} x {}{resizable}{embedded}",
-                    size.width, size.height
-                );
-                window.set_resizable(size.resizable);
-                let _ = window.request_inner_size(window_size(size.width, size.height));
-                window.set_visible(true);
-                self.window = Some(window);
-                self.opened = Some(true);
-            }
-            None => {
-                self.opened = Some(false);
-                event_loop.exit();
-            }
-        }
-        Ok(())
-    }
-
     fn close(&mut self, event_loop: &ActiveEventLoop) {
-        self.plugin().close_editor();
+        if let Some(editor) = self.editor.take() {
+            editor.close(self.session);
+        }
         event_loop.exit();
     }
 }
 
 impl ApplicationHandler for App<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.opened.is_none()
-            && let Err(e) = self.open(event_loop)
-        {
-            self.error = Some(e);
-            event_loop.exit();
+        if self.opened.is_some() {
+            return;
+        }
+        match EditorWindow::open(event_loop, self.session, self.slot, self.title) {
+            Ok(editor) => {
+                self.opened = Some(editor.is_some());
+                self.editor = editor;
+                if self.editor.is_none() {
+                    event_loop.exit();
+                }
+            }
+            Err(e) => {
+                self.error = Some(e);
+                event_loop.exit();
+            }
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => self.close(event_loop),
-            WindowEvent::Resized(size) => {
-                let Some(scale) = self.window.as_ref().map(Window::scale_factor) else {
-                    return;
-                };
-                let (w, h) = editor_size(size, scale);
-                let (aw, ah) = self.plugin().resize_editor(w, h);
-                // Only push back when the editor insists on a clearly
-                // different size, so rounding cannot start a resize loop.
-                if (aw.abs_diff(w) > 1 || ah.abs_diff(h) > 1)
-                    && let Some(window) = &self.window
-                {
-                    let _ = window.request_inner_size(window_size(aw, ah));
-                }
-            }
-            _ => {}
+        let keep = match &mut self.editor {
+            Some(editor) => editor.on_event(self.session, &event),
+            None => true,
+        };
+        if !keep {
+            self.close(event_loop);
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_none() {
+        let Some(editor) = &mut self.editor else {
             return;
-        }
-        let request = self.plugin().take_editor_resize_request();
-        if let (Some(window), Some((w, h))) = (&self.window, request) {
-            let _ = window.request_inner_size(window_size(w, h));
-        }
-        if self.plugin().editor_closed() || !(self.tick)(self.session) {
+        };
+        if !editor.poll(self.session) || !(self.tick)(self.session) {
             self.close(event_loop);
             return;
         }

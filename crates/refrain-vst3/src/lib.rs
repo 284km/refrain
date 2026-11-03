@@ -48,6 +48,9 @@ pub enum Vst3Error {
     /// Saving or loading the plugin's state failed.
     State(&'static str),
     NoAudioOutput,
+    /// Activating again while the processor from the last activation is
+    /// still alive.
+    StillProcessing,
 }
 
 impl fmt::Display for Vst3Error {
@@ -65,6 +68,9 @@ impl fmt::Display for Vst3Error {
             Self::Editor(step) => write!(f, "the plugin's editor failed to {step}"),
             Self::State(step) => write!(f, "the plugin's state failed to {step}"),
             Self::NoAudioOutput => f.write_str("the plugin has no audio output"),
+            Self::StillProcessing => {
+                f.write_str("the plugin is still processing; stop it before activating it again")
+            }
         }
     }
 }
@@ -231,6 +237,14 @@ impl Vst3Plugin {
         sample_rate: f32,
         max_block_frames: usize,
     ) -> Result<Vst3Processor, Vst3Error> {
+        if self.active {
+            // Activated before: its processor must be gone by now.
+            if Arc::strong_count(&self.alive) > 1 {
+                return Err(Vst3Error::StillProcessing);
+            }
+            unsafe { self.component.setActive(0) };
+            self.active = false;
+        }
         let audio = MediaTypes_::kAudio as MediaType;
         let event = MediaTypes_::kEvent as MediaType;
         let input = BusDirections_::kInput as BusDirection;
@@ -773,6 +787,14 @@ const MAX_EVENTS: usize = MAX_BLOCK_EVENTS + MAX_PEDAL_RELEASES;
 // Mapped controllers never reach the pedal, so a plugin that maps the pedal
 // plays it itself, and so does one that maps All Notes Off.
 const _: () = assert!(SUSTAIN < 128 && ALL_NOTES_OFF < 128);
+
+impl Drop for Vst3Processor {
+    fn drop(&mut self) {
+        if self.started {
+            unsafe { self.processor.setProcessing(0) };
+        }
+    }
+}
 
 impl Processor for Vst3Processor {
     fn prepare(&mut self, sample_rate: f32, max_block_frames: usize) {
